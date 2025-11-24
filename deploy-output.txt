@@ -1,0 +1,22 @@
+🚀 Deploying MonBridgeDex to Monad...
+
+📝 Deploying with account: 0x031183bA19513e5E7B3517a39c461a0CdF0a3116
+💰 Account balance: 7.593697618087485155 MON
+
+⏳ Deploying MonBridgeDex contract...
+✅ MonBridgeDex deployed to: 0x7Db8Be2395E0a85269333CA99312c409A5B409f9
+
+📋 Contract Details:
+   - Network: Monad
+   - Address: 0x7Db8Be2395E0a85269333CA99312c409A5B409f9
+   - Deployer: 0x031183bA19513e5E7B3517a39c461a0CdF0a3116
+   - Block: 37768214
+
+💾 Deployment info saved to deployment-info.json
+
+🎉 Deployment complete!
+
+⚠️  Next steps:
+   1. Add Uniswap V2 routers using addRouterV2()
+   2. Add Uniswap V3 routers using addRouterV3()
+   3. Use the HTML interface to manage and test swaps

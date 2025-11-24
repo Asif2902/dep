@@ -1,0 +1,10 @@
+{
+  "network": "monad",
+  "chainId": 143,
+  "contractAddress": "0x7Db8Be2395E0a85269333CA99312c409A5B409f9",
+  "wethAddress": "0x3bd359c1119da7da1d913d1c4d2b7c461115433a",
+  "deployer": "0x031183bA19513e5E7B3517a39c461a0CdF0a3116",
+  "deployedAt": "2025-11-24T21:38:09.645Z",
+  "blockNumber": 37768214,
+  "rpcUrl": "https://rpc.monad.xyz"
+}
