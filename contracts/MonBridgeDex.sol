@@ -885,7 +885,9 @@ contract MonBridgeDex {
         uint16[] memory percentages,
         uint totalExpectedOut
     ) {
-        RouterQuote[] memory allQuotes = _getAllRouterQuotes(totalAmountIn / 4, path); // Test with 25% chunks
+        uint fee = totalAmountIn / FEE_DIVISOR;
+        uint amountForSwap = totalAmountIn - fee;
+        RouterQuote[] memory allQuotes = _getAllRouterQuotes(amountForSwap / 4, path); // Test with 25% chunks after fee
 
         if (allQuotes.length == 0) {
             return (new RouterQuote[](0), new uint16[](0), 0);
@@ -1095,13 +1097,25 @@ contract MonBridgeDex {
         } else if (optimalPath[optimalPath.length - 1] == WETH) {
             swapType = SwapType.TOKEN_TO_ETH;
         } else {
+            // Multi-hop through WETH or direct token-to-token
             swapType = SwapType.TOKEN_TO_TOKEN;
         }
 
         uint amountOutMin = _calculateAdaptiveSlippage(bestAmountOut, priceImpact, userSlippageBPS);
 
-        uint24[] memory v3Fees = new uint24[](1);
-        v3Fees[0] = v3Fee;
+        // Create proper fee array based on path length
+        uint24[] memory v3Fees;
+        if (routerType == RouterType.V3 && optimalPath.length > 2) {
+            // Multi-hop V3 needs (pathLength - 1) fees
+            v3Fees = new uint24[](optimalPath.length - 1);
+            // For now, use same fee tier for all hops (limitation: we only track primary fee)
+            for (uint i = 0; i < v3Fees.length; i++) {
+                v3Fees[i] = v3Fee;
+            }
+        } else {
+            v3Fees = new uint24[](1);
+            v3Fees[0] = v3Fee;
+        }
 
         swapData = SwapData({
             swapType: swapType,
@@ -1157,8 +1171,17 @@ contract MonBridgeDex {
                 swapType = SwapType.TOKEN_TO_TOKEN;
             }
 
-            uint24[] memory v3Fees = new uint24[](1);
-            v3Fees[0] = quotes[i].v3Fee;
+            // Create proper fee array for V3 multi-hop
+            uint24[] memory v3Fees;
+            if (quotes[i].routerType == RouterType.V3 && quotes[i].path.length > 2) {
+                v3Fees = new uint24[](quotes[i].path.length - 1);
+                for (uint j = 0; j < v3Fees.length; j++) {
+                    v3Fees[j] = quotes[i].v3Fee; // Use same fee tier for all hops
+                }
+            } else {
+                v3Fees = new uint24[](1);
+                v3Fees[0] = quotes[i].v3Fee;
+            }
 
             uint splitExpectedOut = (quotes[i].amountOut * percentages[i]) / 10000;
             uint splitMinOut = _calculateAdaptiveSlippage(splitExpectedOut, quotes[i].priceImpact, userSlippageBPS);
@@ -1290,6 +1313,7 @@ contract MonBridgeDex {
     }
 
     /// @notice Find best router with optimal path including V2 WETH routing
+    /// @dev For V3 multi-hop, bestV3Fee contains primary fee tier (additional fees lost - known limitation)
     function _getBestRouterWithPath(uint amountIn, address[] memory path) internal view returns (
         address bestRouter,
         uint bestAmountOut,
@@ -1527,6 +1551,14 @@ contract MonBridgeDex {
         require(swapData.deadline >= block.timestamp, "MonBridgeDex: Transaction deadline has expired");
         require(_validateRouter(swapData.router), "MonBridgeDex: Router is unhealthy or disabled");
         require(swapData.amountIn > 0, "MonBridgeDex: Swap amount must be greater than 0");
+        
+        // Validate V3 fee array matches path length
+        if (swapData.routerType == RouterType.V3) {
+            require(
+                swapData.v3Fees.length == swapData.path.length - 1,
+                "MonBridgeDex: V3 fees array must match path length"
+            );
+        }
 
         uint fee = swapData.amountIn / FEE_DIVISOR;
         uint amountForSwap = swapData.amountIn - fee;
