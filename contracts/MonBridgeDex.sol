@@ -474,7 +474,12 @@ contract MonBridgeDex {
         require(IERC20(token).approve(spender, amount), "Approval failed");
     }
 
-    /// @notice Normalize amount to target decimals
+    /// @notice Normalize amount to target decimals for accurate comparisons
+    /// @dev Handles USDC (6) vs DAI (18) and other decimal mismatches
+    /// @param token Token address to get decimals from
+    /// @param amount Amount to normalize
+    /// @param targetDecimals Target decimal precision (usually 18)
+    /// @return Normalized amount
     function _normalizeAmount(
         address token,
         uint256 amount,
@@ -485,10 +490,29 @@ contract MonBridgeDex {
         if (tokenDecimals == targetDecimals) {
             return amount;
         } else if (tokenDecimals > targetDecimals) {
+            // Scale down (e.g., 18 -> 6)
             return amount / (10 ** (tokenDecimals - targetDecimals));
         } else {
+            // Scale up (e.g., 6 -> 18)
             return amount * (10 ** (targetDecimals - tokenDecimals));
         }
+    }
+
+    /// @notice Compare two token amounts with different decimals
+    /// @dev Normalizes both to 18 decimals before comparison
+    /// @return 1 if amountA > amountB, -1 if amountA < amountB, 0 if equal
+    function _compareAmounts(
+        address tokenA,
+        uint256 amountA,
+        address tokenB,
+        uint256 amountB
+    ) internal view returns (int8) {
+        uint256 normalizedA = _normalizeAmount(tokenA, amountA, 18);
+        uint256 normalizedB = _normalizeAmount(tokenB, amountB, 18);
+        
+        if (normalizedA > normalizedB) return 1;
+        if (normalizedA < normalizedB) return -1;
+        return 0;
     }
 
     /// @notice Validate pool price against TWAP to prevent manipulation
@@ -499,6 +523,11 @@ contract MonBridgeDex {
         // In production, you would implement proper TWAP calculation using observations
         // For now, we return true to not block swaps
         // TODO: Implement full TWAP oracle with historical price checks
+        
+        // Suppress unused parameter warnings
+        pool;
+        currentPrice;
+        
         return true;
     }
 
@@ -511,6 +540,9 @@ contract MonBridgeDex {
     }
 
     /// @notice Calculate V3 swap output using proper constant product formula
+    /// @dev Uses the formula: L^2 = x * y for constant product
+    /// For token0 -> token1: sqrtPriceNext = (L * sqrtPrice) / (L + amountIn * sqrtPrice / Q96)
+    /// For token1 -> token0: sqrtPriceNext = sqrtPrice + (amountIn * Q96) / L
     function _calculateV3SwapOutput(
         address pool,
         uint256 amountIn,
@@ -532,6 +564,7 @@ contract MonBridgeDex {
             if (!_validateTWAP(pool, sqrtPriceX96)) {
                 return (0, type(uint256).max);
             }
+            
             uint128 liquidity;
             try IUniswapV3Pool(pool).liquidity() returns (uint128 liq) {
                 liquidity = liq;
@@ -549,41 +582,51 @@ contract MonBridgeDex {
             address token0 = IUniswapV3Pool(pool).token0();
             bool zeroForOne = tokenIn == token0;
             
+            // Calculate fee and net amount
             uint256 feeAmount = (amountIn * feeTier) / 1000000;
             uint256 amountInAfterFee = amountIn - feeAmount;
             
             uint160 sqrtPriceNextX96;
             
             if (zeroForOne) {
-                uint256 denominator = (uint256(liquidity) << 96) + 
-                    FullMath.mulDiv(amountInAfterFee, sqrtPriceX96, FixedPoint96.Q96);
+                // token0 -> token1 swap
+                // sqrtPriceNext = (L * sqrtPrice) / (L + amountIn * sqrtPrice / Q96)
+                uint256 product = FullMath.mulDiv(amountInAfterFee, sqrtPriceX96, FixedPoint96.Q96);
+                uint256 denominator = uint256(liquidity) + product;
                 
-                if (denominator == 0) return (0, type(uint256).max);
+                if (denominator == 0 || denominator <= product) return (0, type(uint256).max);
                 
                 sqrtPriceNextX96 = uint160(
-                    FullMath.mulDiv(uint256(liquidity) << 96, sqrtPriceX96, denominator)
+                    FullMath.mulDiv(liquidity, sqrtPriceX96, denominator)
                 );
                 
                 if (sqrtPriceNextX96 >= sqrtPriceX96) return (0, type(uint256).max);
                 
+                // amountOut = L * (sqrtPrice - sqrtPriceNext) / Q96
                 amountOut = FullMath.mulDiv(
                     liquidity,
                     sqrtPriceX96 - sqrtPriceNextX96,
                     FixedPoint96.Q96
                 );
                 
+                // Price impact = (sqrtPrice - sqrtPriceNext) / sqrtPrice * 10000
                 priceImpact = FullMath.mulDiv(
                     uint256(sqrtPriceX96 - sqrtPriceNextX96) * 10000,
                     FixedPoint96.Q96,
                     sqrtPriceX96
                 );
             } else {
-                sqrtPriceNextX96 = uint160(
-                    uint256(sqrtPriceX96) + FullMath.mulDiv(amountInAfterFee, FixedPoint96.Q96, liquidity)
-                );
+                // token1 -> token0 swap
+                // sqrtPriceNext = sqrtPrice + (amountIn * Q96) / L
+                uint256 quotient = FullMath.mulDiv(amountInAfterFee, FixedPoint96.Q96, liquidity);
+                
+                if (quotient > type(uint160).max - sqrtPriceX96) return (0, type(uint256).max);
+                
+                sqrtPriceNextX96 = uint160(uint256(sqrtPriceX96) + quotient);
                 
                 if (sqrtPriceNextX96 <= sqrtPriceX96) return (0, type(uint256).max);
                 
+                // amountOut = L * (sqrtPriceNext - sqrtPrice) / (sqrtPrice * sqrtPriceNext / Q96)
                 uint256 priceDelta = FullMath.mulDiv(
                     sqrtPriceX96,
                     sqrtPriceNextX96,
@@ -598,6 +641,7 @@ contract MonBridgeDex {
                     priceDelta
                 );
                 
+                // Price impact = (sqrtPriceNext - sqrtPrice) / sqrtPrice * 10000
                 priceImpact = FullMath.mulDiv(
                     uint256(sqrtPriceNextX96 - sqrtPriceX96) * 10000,
                     FixedPoint96.Q96,
@@ -612,6 +656,7 @@ contract MonBridgeDex {
     }
 
     /// @notice Find best V3 pool with optimal fee tier selection
+    /// @dev Prioritizes: 1) Net output after impact penalty, 2) Lower fee tier on ties
     function _getBestV3Pool(
         address factory,
         address tokenIn,
@@ -643,9 +688,12 @@ contract MonBridgeDex {
             
             if (amountOut == 0) continue;
             
+            // Calculate score: amountOut - impact penalty
+            // Higher impact = higher penalty
             uint256 impactPenalty = (amountOut * impact) / 10000;
             uint256 score = amountOut > impactPenalty ? amountOut - impactPenalty : 0;
             
+            // Select best score, with lower fee tier as tie-breaker
             if (score > bestScore || (score == bestScore && fee < bestFee)) {
                 bestScore = score;
                 bestAmountOut = amountOut;
@@ -752,6 +800,11 @@ contract MonBridgeDex {
     }
 
     /// @notice Calculate adaptive slippage based on price impact
+    /// @dev For high impact (>1%), adds proportional slippage buffer
+    /// @param amountOut Expected output amount
+    /// @param priceImpact Price impact in basis points (100 = 1%)
+    /// @param userSlippageBPS User-specified slippage, 0 for auto
+    /// @return minAmountOut Minimum acceptable output amount
     function _calculateAdaptiveSlippage(
         uint256 amountOut,
         uint256 priceImpact,
@@ -760,21 +813,26 @@ contract MonBridgeDex {
         uint256 slippageBPS;
         
         if (userSlippageBPS > 0) {
-            require(userSlippageBPS <= slippageConfig.maxSlippageBPS, "Slippage too high");
+            // User override
+            require(userSlippageBPS <= slippageConfig.maxSlippageBPS, "MonBridgeDex: Slippage too high");
             slippageBPS = userSlippageBPS;
         } else {
-            slippageBPS = slippageConfig.baseSlippageBPS;
+            // Adaptive calculation
+            slippageBPS = slippageConfig.baseSlippageBPS; // Start with base (e.g., 50 = 0.5%)
             
-            if (priceImpact > 100) {
+            // Add buffer for high impact trades
+            if (priceImpact > 100) { // > 1% impact
                 uint256 additionalSlippage = (priceImpact * slippageConfig.impactMultiplier) / 10000;
                 slippageBPS += additionalSlippage;
             }
             
+            // Cap at maximum allowed
             if (slippageBPS > slippageConfig.maxSlippageBPS) {
                 slippageBPS = slippageConfig.maxSlippageBPS;
             }
         }
         
+        // Calculate minimum output: amountOut * (1 - slippage%)
         minAmountOut = (amountOut * (10000 - slippageBPS)) / 10000;
     }
 
@@ -1076,13 +1134,17 @@ contract MonBridgeDex {
         }
     }
 
-    /// @notice Encode V3 multi-hop path
+    /// @notice Encode V3 multi-hop path for exactInput
+    /// @dev Path format: token0 | fee01 | token1 | fee12 | token2 | ...
+    /// Example: USDC -> 500 -> WETH -> 3000 -> DAI
     function _encodeV3Path(address[] memory tokens, uint24[] memory fees) internal pure returns (bytes memory path) {
-        require(tokens.length >= 2, "Invalid path");
-        require(tokens.length == fees.length + 1, "Path/fee mismatch");
+        require(tokens.length >= 2, "MonBridgeDex: Invalid path length");
+        require(tokens.length == fees.length + 1, "MonBridgeDex: Path/fee array mismatch");
         
+        // Start with first token
         path = abi.encodePacked(tokens[0]);
         
+        // Append each (fee, token) pair
         for (uint i = 0; i < fees.length; i++) {
             path = abi.encodePacked(path, fees[i], tokens[i + 1]);
         }
