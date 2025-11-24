@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MonBridgeDex - DEX Aggregator Control Panel</title>
+    <script src="https://cdn.ethers.io/lib/ethers-5.7.2.umd.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        header p {
+            opacity: 0.9;
+            font-size: 1.1em;
+        }
+        
+        .status-bar {
+            background: #f8f9fa;
+            padding: 15px 30px;
+            border-bottom: 2px solid #e9ecef;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status-label {
+            font-weight: 600;
+            color: #495057;
+        }
+        
+        .status-value {
+            color: #667eea;
+            font-family: monospace;
+        }
+        
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #28a745;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .content {
+            padding: 30px;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 30px;
+            border-bottom: 2px solid #e9ecef;
+        }
+        
+        .tab {
+            padding: 15px 30px;
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            color: #6c757d;
+            border-bottom: 3px solid transparent;
+            transition: all 0.3s;
+        }
+        
+        .tab:hover {
+            color: #667eea;
+        }
+        
+        .tab.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+            animation: fadeIn 0.3s;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .card {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 25px;
+            margin-bottom: 20px;
+            border: 1px solid #e9ecef;
+        }
+        
+        .card h3 {
+            color: #495057;
+            margin-bottom: 20px;
+            font-size: 1.3em;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #495057;
+        }
+        
+        input, select, textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .input-hint {
+            font-size: 12px;
+            color: #6c757d;
+            margin-top: 5px;
+        }
+        
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .btn-secondary {
+            background: #6c757d;
+        }
+        
+        .btn-success {
+            background: #28a745;
+        }
+        
+        .btn-danger {
+            background: #dc3545;
+        }
+        
+        .router-list {
+            list-style: none;
+            margin-top: 15px;
+        }
+        
+        .router-item {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border: 1px solid #e9ecef;
+        }
+        
+        .router-address {
+            font-family: monospace;
+            color: #667eea;
+            font-weight: 600;
+        }
+        
+        .output-box {
+            background: #1e1e1e;
+            color: #00ff00;
+            padding: 20px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 14px;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            margin-top: 15px;
+        }
+        
+        .route-display {
+            background: white;
+            border: 2px solid #667eea;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        
+        .route-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .route-info-item {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+        }
+        
+        .route-info-label {
+            font-size: 12px;
+            color: #6c757d;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }
+        
+        .route-info-value {
+            font-size: 18px;
+            font-weight: 700;
+            color: #495057;
+        }
+        
+        .route-path {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin: 20px 0;
+        }
+        
+        .route-token {
+            background: #667eea;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 20px;
+            font-weight: 600;
+        }
+        
+        .route-arrow {
+            color: #667eea;
+            font-size: 24px;
+        }
+        
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .alert-info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255,255,255,.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s ease-in-out infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .execute-data {
+            background: #1e1e1e;
+            color: #00ff00;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 12px;
+            margin-top: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔄 MonBridgeDex</h1>
+            <p>Production-Grade DEX Aggregator Control Panel</p>
+        </header>
+        
+        <div class="status-bar">
+            <div class="status-item">
+                <div class="status-dot"></div>
+                <span class="status-label">Network:</span>
+                <span class="status-value" id="network">Not Connected</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Contract:</span>
+                <span class="status-value" id="contract-address">-</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Account:</span>
+                <span class="status-value" id="account">-</span>
+            </div>
+            <button id="connect-wallet" onclick="connectWallet()">Connect Wallet</button>
+        </div>
+        
+        <div class="content">
+            <div class="tabs">
+                <button class="tab active" onclick="switchTab('setup')">⚙️ Setup</button>
+                <button class="tab" onclick="switchTab('routers')">🔧 Manage Routers</button>
+                <button class="tab" onclick="switchTab('trade')">💱 Find & Execute Trade</button>
+                <button class="tab" onclick="switchTab('admin')">👑 Admin</button>
+            </div>
+            
+            <!-- Setup Tab -->
+            <div id="setup" class="tab-content active">
+                <div class="card">
+                    <h3>📋 Contract Configuration</h3>
+                    <div class="form-group">
+                        <label>Contract Address</label>
+                        <input type="text" id="setup-contract-address" placeholder="0x..." />
+                        <div class="input-hint">Enter the deployed MonBridgeDex contract address</div>
+                    </div>
+                    <button onclick="loadContract()">Load Contract</button>
+                </div>
+                
+                <div class="card">
+                    <h3>📊 Contract Status</h3>
+                    <div id="contract-status" class="output-box">No contract loaded</div>
+                </div>
+            </div>
+            
+            <!-- Routers Tab -->
+            <div id="routers" class="tab-content">
+                <div class="card">
+                    <h3>➕ Add V2 Router</h3>
+                    <div class="form-group">
+                        <label>Router Address</label>
+                        <input type="text" id="v2-router-address" placeholder="0x..." />
+                        <div class="input-hint">Uniswap V2 compatible router address</div>
+                    </div>
+                    <button onclick="addV2Router()">Add V2 Router</button>
+                </div>
+                
+                <div class="card">
+                    <h3>➕ Add V3 Router</h3>
+                    <div class="form-group">
+                        <label>Router Address</label>
+                        <input type="text" id="v3-router-address" placeholder="0x..." />
+                        <div class="input-hint">Uniswap V3 compatible router address</div>
+                    </div>
+                    <button onclick="addV3Router()">Add V3 Router</button>
+                </div>
+                
+                <div class="card">
+                    <h3>📜 Current Routers</h3>
+                    <button onclick="loadRouters()">Refresh Router List</button>
+                    <div id="router-lists" class="output-box">Click refresh to load routers</div>
+                </div>
+            </div>
+            
+            <!-- Trade Tab -->
+            <div id="trade" class="tab-content">
+                <div class="card">
+                    <h3>🔍 Find Best Route</h3>
+                    <div class="form-group">
+                        <label>Token In Address</label>
+                        <input type="text" id="token-in" placeholder="0x..." />
+                    </div>
+                    <div class="form-group">
+                        <label>Token Out Address</label>
+                        <input type="text" id="token-out" placeholder="0x..." />
+                    </div>
+                    <div class="form-group">
+                        <label>Amount In (in token units)</label>
+                        <input type="text" id="amount-in" placeholder="1.0" />
+                        <div class="input-hint">Enter amount with decimals (e.g., 1.5 for 1.5 tokens)</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Slippage Tolerance (BPS)</label>
+                        <input type="number" id="slippage-bps" value="50" />
+                        <div class="input-hint">50 = 0.5%, 100 = 1%, 500 = 5%</div>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="fee-on-transfer" />
+                            Token has fee-on-transfer
+                        </label>
+                    </div>
+                    <button onclick="findBestRoute()">Find Best Route</button>
+                </div>
+                
+                <div id="route-result" style="display: none;">
+                    <div class="route-display">
+                        <h3>✅ Best Route Found</h3>
+                        
+                        <div class="route-info">
+                            <div class="route-info-item">
+                                <div class="route-info-label">Amount In</div>
+                                <div class="route-info-value" id="display-amount-in">-</div>
+                            </div>
+                            <div class="route-info-item">
+                                <div class="route-info-label">Amount Out (Expected)</div>
+                                <div class="route-info-value" id="display-amount-out">-</div>
+                            </div>
+                            <div class="route-info-item">
+                                <div class="route-info-label">Router Type</div>
+                                <div class="route-info-value" id="display-router-type">-</div>
+                            </div>
+                            <div class="route-info-item">
+                                <div class="route-info-label">Fee (if V3)</div>
+                                <div class="route-info-value" id="display-fee">-</div>
+                            </div>
+                        </div>
+                        
+                        <div class="route-path">
+                            <div class="route-token" id="path-token-in">TOKEN IN</div>
+                            <div class="route-arrow">→</div>
+                            <div class="route-token" id="path-token-out">TOKEN OUT</div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>Router Address</label>
+                            <div class="output-box" id="display-router-address" style="max-height: 50px;">-</div>
+                        </div>
+                        
+                        <button class="btn-success" onclick="executeSwap()">Execute Swap</button>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>📦 Execute Function Data (for debugging)</h3>
+                        <div class="execute-data" id="execute-data">-</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Admin Tab -->
+            <div id="admin" class="tab-content">
+                <div class="card">
+                    <h3>💰 Withdraw Fees</h3>
+                    <p>Withdraw collected fees to owner address</p>
+                    <button onclick="withdrawFees()">Withdraw Fees</button>
+                </div>
+                
+                <div class="card">
+                    <h3>🚨 Emergency Withdraw</h3>
+                    <div class="form-group">
+                        <label>Token Address (leave empty for ETH)</label>
+                        <input type="text" id="emergency-token" placeholder="0x... or leave empty" />
+                    </div>
+                    <button class="btn-danger" onclick="emergencyWithdraw()">Emergency Withdraw</button>
+                </div>
+                
+                <div class="card">
+                    <h3>⚙️ Set Fee Percentage</h3>
+                    <div class="form-group">
+                        <label>Fee (BPS)</label>
+                        <input type="number" id="new-fee-bps" placeholder="20" />
+                        <div class="input-hint">20 BPS = 0.2%</div>
+                    </div>
+                    <button onclick="setFee()">Update Fee</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let provider, signer, contract;
+        let contractABI;
+        let currentSwapData = null;
+        
+        // Contract ABI - Add your contract ABI here
+        const MONBRIDGEDEX_ABI = [
+            "function owner() view returns (address)",
+            "function getRoutersV2Count() view returns (uint)",
+            "function getRoutersV3Count() view returns (uint)",
+            "function getV3FeeTiers() view returns (uint24[])",
+            "function feePercent() view returns (uint)",
+            "function addRouterV2(address router)",
+            "function addRouterV3(address router)",
+            "function getBestSwapData(uint amountIn, address[] path, bool supportFeeOnTransfer, uint16 userSlippageBPS) view returns (tuple(address router, address[] path, uint amountIn, uint amountOutMin, uint deadline, uint8 swapType, uint24 v3Fee))",
+            "function execute(tuple(address router, address[] path, uint amountIn, uint amountOutMin, uint deadline, uint8 swapType, uint24 v3Fee) swapData) payable returns (uint)",
+            "function withdrawFees()",
+            "function setFeePercent(uint16 newFee)"
+        ];
+        
+        async function connectWallet() {
+            try {
+                if (typeof window.ethereum === 'undefined') {
+                    alert('Please install MetaMask!');
+                    return;
+                }
+                
+                await window.ethereum.request({ method: 'eth_requestAccounts' });
+                provider = new ethers.providers.Web3Provider(window.ethereum);
+                signer = provider.getSigner();
+                
+                const address = await signer.getAddress();
+                const network = await provider.getNetwork();
+                
+                document.getElementById('account').textContent = address.slice(0, 6) + '...' + address.slice(-4);
+                document.getElementById('network').textContent = network.name + ' (' + network.chainId + ')';
+                
+                showAlert('success', 'Wallet connected: ' + address);
+            } catch (error) {
+                showAlert('error', 'Failed to connect wallet: ' + error.message);
+            }
+        }
+        
+        async function loadContract() {
+            try {
+                const address = document.getElementById('setup-contract-address').value;
+                if (!address) {
+                    showAlert('error', 'Please enter contract address');
+                    return;
+                }
+                
+                if (!signer) {
+                    await connectWallet();
+                }
+                
+                contract = new ethers.Contract(address, MONBRIDGEDEX_ABI, signer);
+                document.getElementById('contract-address').textContent = address.slice(0, 6) + '...' + address.slice(-4);
+                
+                // Load contract status
+                const owner = await contract.owner();
+                const v2Count = await contract.getRoutersV2Count();
+                const v3Count = await contract.getRoutersV3Count();
+                const feeTiers = await contract.getV3FeeTiers();
+                const fee = await contract.feePercent();
+                
+                const status = `Contract Loaded Successfully!
+                
+Owner: ${owner}
+V2 Routers: ${v2Count}
+V3 Routers: ${v3Count}
+V3 Fee Tiers: ${feeTiers.map(t => t.toString()).join(', ')} bps
+Platform Fee: ${fee} bps (${(fee / 100).toFixed(2)}%)`;
+                
+                document.getElementById('contract-status').textContent = status;
+                showAlert('success', 'Contract loaded successfully!');
+            } catch (error) {
+                showAlert('error', 'Failed to load contract: ' + error.message);
+            }
+        }
+        
+        async function addV2Router() {
+            try {
+                const address = document.getElementById('v2-router-address').value;
+                if (!address) {
+                    showAlert('error', 'Please enter router address');
+                    return;
+                }
+                
+                const tx = await contract.addRouterV2(address);
+                showAlert('info', 'Transaction submitted. Waiting for confirmation...');
+                await tx.wait();
+                
+                showAlert('success', 'V2 Router added: ' + address);
+                document.getElementById('v2-router-address').value = '';
+            } catch (error) {
+                showAlert('error', 'Failed to add V2 router: ' + error.message);
+            }
+        }
+        
+        async function addV3Router() {
+            try {
+                const address = document.getElementById('v3-router-address').value;
+                if (!address) {
+                    showAlert('error', 'Please enter router address');
+                    return;
+                }
+                
+                const tx = await contract.addRouterV3(address);
+                showAlert('info', 'Transaction submitted. Waiting for confirmation...');
+                await tx.wait();
+                
+                showAlert('success', 'V3 Router added: ' + address);
+                document.getElementById('v3-router-address').value = '';
+            } catch (error) {
+                showAlert('error', 'Failed to add V3 router: ' + error.message);
+            }
+        }
+        
+        async function loadRouters() {
+            try {
+                const v2Count = await contract.getRoutersV2Count();
+                const v3Count = await contract.getRoutersV3Count();
+                
+                let output = `V2 Routers: ${v2Count}\nV3 Routers: ${v3Count}\n\n`;
+                output += 'Note: Individual router addresses require additional contract methods to retrieve.';
+                
+                document.getElementById('router-lists').textContent = output;
+            } catch (error) {
+                showAlert('error', 'Failed to load routers: ' + error.message);
+            }
+        }
+        
+        async function findBestRoute() {
+            try {
+                const tokenIn = document.getElementById('token-in').value;
+                const tokenOut = document.getElementById('token-out').value;
+                const amountInRaw = document.getElementById('amount-in').value;
+                const slippageBPS = parseInt(document.getElementById('slippage-bps').value);
+                const feeOnTransfer = document.getElementById('fee-on-transfer').checked;
+                
+                if (!tokenIn || !tokenOut || !amountInRaw) {
+                    showAlert('error', 'Please fill all fields');
+                    return;
+                }
+                
+                // Get token decimals and convert amount
+                const tokenInContract = new ethers.Contract(tokenIn, ['function decimals() view returns (uint8)'], provider);
+                const decimals = await tokenInContract.decimals();
+                const amountIn = ethers.utils.parseUnits(amountInRaw, decimals);
+                
+                const path = [tokenIn, tokenOut];
+                
+                showAlert('info', 'Finding best route...');
+                
+                const swapData = await contract.getBestSwapData(
+                    amountIn,
+                    path,
+                    feeOnTransfer,
+                    slippageBPS
+                );
+                
+                currentSwapData = swapData;
+                
+                // Display route
+                const routerTypes = ['ETH → Token', 'Token → ETH', 'Token → Token', 'V3'];
+                const amountOut = ethers.utils.formatUnits(swapData.amountOutMin, decimals);
+                
+                document.getElementById('display-amount-in').textContent = amountInRaw;
+                document.getElementById('display-amount-out').textContent = amountOut;
+                document.getElementById('display-router-type').textContent = routerTypes[swapData.swapType] || 'Unknown';
+                document.getElementById('display-fee').textContent = swapData.v3Fee > 0 ? (swapData.v3Fee / 10000).toFixed(2) + '%' : 'N/A';
+                document.getElementById('display-router-address').textContent = swapData.router;
+                document.getElementById('path-token-in').textContent = tokenIn.slice(0, 8) + '...';
+                document.getElementById('path-token-out').textContent = tokenOut.slice(0, 8) + '...';
+                
+                // Show execute data
+                const executeData = JSON.stringify(swapData, null, 2);
+                document.getElementById('execute-data').textContent = executeData;
+                
+                document.getElementById('route-result').style.display = 'block';
+                showAlert('success', 'Best route found!');
+                
+            } catch (error) {
+                showAlert('error', 'Failed to find route: ' + error.message);
+                console.error(error);
+            }
+        }
+        
+        async function executeSwap() {
+            try {
+                if (!currentSwapData) {
+                    showAlert('error', 'No route data. Please find a route first.');
+                    return;
+                }
+                
+                showAlert('info', 'Executing swap...');
+                
+                const value = currentSwapData.swapType === 0 ? currentSwapData.amountIn : 0;
+                
+                const tx = await contract.execute(currentSwapData, { value });
+                showAlert('info', 'Transaction submitted: ' + tx.hash);
+                
+                const receipt = await tx.wait();
+                showAlert('success', 'Swap executed successfully! TX: ' + receipt.transactionHash);
+                
+            } catch (error) {
+                showAlert('error', 'Failed to execute swap: ' + error.message);
+                console.error(error);
+            }
+        }
+        
+        async function withdrawFees() {
+            try {
+                const tx = await contract.withdrawFees();
+                showAlert('info', 'Withdrawing fees...');
+                await tx.wait();
+                showAlert('success', 'Fees withdrawn successfully!');
+            } catch (error) {
+                showAlert('error', 'Failed to withdraw fees: ' + error.message);
+            }
+        }
+        
+        async function emergencyWithdraw() {
+            try {
+                const token = document.getElementById('emergency-token').value;
+                // Note: You need to add emergencyWithdraw function to your contract
+                showAlert('info', 'This feature requires emergencyWithdraw function in contract');
+            } catch (error) {
+                showAlert('error', 'Failed: ' + error.message);
+            }
+        }
+        
+        async function setFee() {
+            try {
+                const newFee = parseInt(document.getElementById('new-fee-bps').value);
+                const tx = await contract.setFeePercent(newFee);
+                showAlert('info', 'Updating fee...');
+                await tx.wait();
+                showAlert('success', 'Fee updated to ' + newFee + ' BPS');
+            } catch (error) {
+                showAlert('error', 'Failed to set fee: ' + error.message);
+            }
+        }
+        
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            
+            event.target.classList.add('active');
+            document.getElementById(tabName).classList.add('active');
+        }
+        
+        function showAlert(type, message) {
+            const alertDiv = document.createElement('div');
+            alertDiv.className = `alert alert-${type}`;
+            alertDiv.textContent = message;
+            
+            const container = document.querySelector('.content');
+            container.insertBefore(alertDiv, container.firstChild);
+            
+            setTimeout(() => alertDiv.remove(), 5000);
+        }
+        
+        // Auto-connect on load if wallet is available
+        window.addEventListener('load', () => {
+            if (typeof window.ethereum !== 'undefined') {
+                ethereum.on('accountsChanged', (accounts) => {
+                    if (accounts.length > 0) {
+                        connectWallet();
+                    }
+                });
+            }
+        });
+    </script>
+</body>
+</html>
