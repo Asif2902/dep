@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
@@ -6,23 +5,23 @@ pragma solidity ^0.8.0;
 interface IUniswapV2Router02 {
     function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
     function swapExactETHForTokens(
-        uint amountOutMin, 
-        address[] calldata path, 
-        address to, 
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
         uint deadline
     ) external payable returns (uint[] memory amounts);
     function swapExactTokensForETH(
-        uint amountIn, 
-        uint amountOutMin, 
-        address[] calldata path, 
-        address to, 
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
         uint deadline
     ) external returns (uint[] memory amounts);
     function swapExactTokensForTokens(
-        uint amountIn, 
-        uint amountOutMin, 
-        address[] calldata path, 
-        address to, 
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
         uint deadline
     ) external returns (uint[] memory amounts);
     function swapExactETHForTokensSupportingFeeOnTransferTokens(
@@ -188,7 +187,7 @@ library FixedPoint96 {
     uint256 internal constant Q96 = 0x1000000000000000000000000;
 }
 
-/// @title MonBridgeDex 
+/// @title MonBridgeDex
 /// @notice Production-grade DEX aggregator with Uniswap V2 and V3 support
 contract MonBridgeDex {
     address public owner;
@@ -207,7 +206,7 @@ contract MonBridgeDex {
 
     bool private _locked;
     bool public paused;
-    
+
     // Router health tracking
     struct RouterInfo {
         bool isActive;
@@ -357,7 +356,7 @@ contract MonBridgeDex {
         v3FeeTiers.push(500);
         v3FeeTiers.push(3000);
         v3FeeTiers.push(10000);
-        
+
         slippageConfig = SlippageConfig({
             baseSlippageBPS: 50,
             impactMultiplier: 150,
@@ -498,17 +497,17 @@ contract MonBridgeDex {
     function _safeApprove(address token, address spender, uint256 amount) internal {
         // Check current allowance
         uint256 currentAllowance = IERC20(token).allowance(address(this), spender);
-        
+
         // If allowance is already sufficient, no need to approve
         if (currentAllowance >= amount) {
             return;
         }
-        
+
         // Some tokens (like USDT) require resetting allowance to 0 first
         if (currentAllowance > 0) {
             require(IERC20(token).approve(spender, 0), "Approval reset failed");
         }
-        
+
         // Set new allowance
         require(IERC20(token).approve(spender, amount), "Approval failed");
     }
@@ -525,7 +524,7 @@ contract MonBridgeDex {
         uint8 targetDecimals
     ) internal view returns (uint256) {
         uint8 tokenDecimals = IERC20(token).decimals();
-        
+
         if (tokenDecimals == targetDecimals) {
             return amount;
         } else if (tokenDecimals > targetDecimals) {
@@ -548,7 +547,7 @@ contract MonBridgeDex {
     ) internal view returns (int8) {
         uint256 normalizedA = _normalizeAmount(tokenA, amountA, 18);
         uint256 normalizedB = _normalizeAmount(tokenB, amountB, 18);
-        
+
         if (normalizedA > normalizedB) return 1;
         if (normalizedA < normalizedB) return -1;
         return 0;
@@ -557,23 +556,23 @@ contract MonBridgeDex {
     /// @notice Validate pool price against TWAP to prevent manipulation
     function _validateTWAP(address pool, uint160 currentPrice) internal view returns (bool) {
         if (!twapConfig.enableTWAPCheck) return true;
-        
+
         // This is a simplified TWAP check
         // In production, you would implement proper TWAP calculation using observations
         // For now, we return true to not block swaps
         // TODO: Implement full TWAP oracle with historical price checks
-        
+
         // Suppress unused parameter warnings
         pool;
         currentPrice;
-        
+
         return true;
     }
 
     /// @notice Validate pool liquidity meets minimum requirements
     function _validateLiquidity(uint128 liquidity) internal view returns (bool) {
         if (!liquidityConfig.requireLiquidityCheck) return true;
-        
+
         // Simplified check - in production would convert to USD value
         return liquidity >= uint128(liquidityConfig.minLiquidityUSD);
     }
@@ -589,7 +588,7 @@ contract MonBridgeDex {
         uint24 feeTier
     ) internal view returns (uint256 amountOut, uint256 priceImpact) {
         if (pool == address(0)) return (0, type(uint256).max);
-        
+
         try IUniswapV3Pool(pool).slot0() returns (
             uint160 sqrtPriceX96,
             int24,
@@ -603,7 +602,7 @@ contract MonBridgeDex {
             if (!_validateTWAP(pool, sqrtPriceX96)) {
                 return (0, type(uint256).max);
             }
-            
+
             uint128 liquidity;
             try IUniswapV3Pool(pool).liquidity() returns (uint128 liq) {
                 liquidity = liq;
@@ -612,7 +611,7 @@ contract MonBridgeDex {
             }
 
             if (liquidity == 0 || sqrtPriceX96 == 0) return (0, type(uint256).max);
-            
+
             // Validate liquidity meets minimum requirements
             if (!_validateLiquidity(liquidity)) {
                 return (0, type(uint256).max);
@@ -620,34 +619,34 @@ contract MonBridgeDex {
 
             address token0 = IUniswapV3Pool(pool).token0();
             bool zeroForOne = tokenIn == token0;
-            
+
             // Calculate fee and net amount
             uint256 feeAmount = (amountIn * feeTier) / 1000000;
             uint256 amountInAfterFee = amountIn - feeAmount;
-            
+
             uint160 sqrtPriceNextX96;
-            
+
             if (zeroForOne) {
                 // token0 -> token1 swap
                 // sqrtPriceNext = (L * sqrtPrice) / (L + amountIn * sqrtPrice / Q96)
                 uint256 product = FullMath.mulDiv(amountInAfterFee, sqrtPriceX96, FixedPoint96.Q96);
                 uint256 denominator = uint256(liquidity) + product;
-                
+
                 if (denominator == 0 || denominator <= product) return (0, type(uint256).max);
-                
+
                 sqrtPriceNextX96 = uint160(
                     FullMath.mulDiv(liquidity, sqrtPriceX96, denominator)
                 );
-                
+
                 if (sqrtPriceNextX96 >= sqrtPriceX96) return (0, type(uint256).max);
-                
+
                 // amountOut = L * (sqrtPrice - sqrtPriceNext) / Q96
                 amountOut = FullMath.mulDiv(
                     liquidity,
                     sqrtPriceX96 - sqrtPriceNextX96,
                     FixedPoint96.Q96
                 );
-                
+
                 // Price impact = (sqrtPrice - sqrtPriceNext) / sqrtPrice * 10000
                 priceImpact = FullMath.mulDiv(
                     uint256(sqrtPriceX96 - sqrtPriceNextX96) * 10000,
@@ -658,28 +657,28 @@ contract MonBridgeDex {
                 // token1 -> token0 swap
                 // sqrtPriceNext = sqrtPrice + (amountIn * Q96) / L
                 uint256 quotient = FullMath.mulDiv(amountInAfterFee, FixedPoint96.Q96, liquidity);
-                
+
                 if (quotient > type(uint160).max - sqrtPriceX96) return (0, type(uint256).max);
-                
+
                 sqrtPriceNextX96 = uint160(uint256(sqrtPriceX96) + quotient);
-                
+
                 if (sqrtPriceNextX96 <= sqrtPriceX96) return (0, type(uint256).max);
-                
+
                 // amountOut = L * (sqrtPriceNext - sqrtPrice) / (sqrtPrice * sqrtPriceNext / Q96)
                 uint256 priceDelta = FullMath.mulDiv(
                     sqrtPriceX96,
                     sqrtPriceNextX96,
                     FixedPoint96.Q96
                 );
-                
+
                 if (priceDelta == 0) return (0, type(uint256).max);
-                
+
                 amountOut = FullMath.mulDiv(
                     liquidity,
                     sqrtPriceNextX96 - sqrtPriceX96,
                     priceDelta
                 );
-                
+
                 // Price impact = (sqrtPriceNext - sqrtPrice) / sqrtPrice * 10000
                 priceImpact = FullMath.mulDiv(
                     uint256(sqrtPriceNextX96 - sqrtPriceX96) * 10000,
@@ -710,28 +709,28 @@ contract MonBridgeDex {
         bestAmountOut = 0;
         bestImpact = type(uint).max;
         uint256 bestScore = 0;
-        
+
         for (uint i = 0; i < v3FeeTiers.length; i++) {
             uint24 fee = v3FeeTiers[i];
             address pool;
-            
+
             try IUniswapV3Factory(factory).getPool(tokenIn, tokenOut, fee) returns (address p) {
                 pool = p;
             } catch {
                 continue;
             }
-            
+
             if (pool == address(0)) continue;
-            
+
             (uint amountOut, uint impact) = _calculateV3SwapOutput(pool, amountIn, tokenIn, fee);
-            
+
             if (amountOut == 0) continue;
-            
+
             // Calculate score: amountOut - impact penalty
             // Higher impact = higher penalty
             uint256 impactPenalty = (amountOut * impact) / 10000;
             uint256 score = amountOut > impactPenalty ? amountOut - impactPenalty : 0;
-            
+
             // Select best score, with lower fee tier as tie-breaker
             if (score > bestScore || (score == bestScore && fee < bestFee)) {
                 bestScore = score;
@@ -746,10 +745,10 @@ contract MonBridgeDex {
     /// @notice Validate router is active and healthy
     function _validateRouter(address router) internal view returns (bool) {
         RouterInfo memory info = routerInfo[router];
-        
+
         if (!info.isActive) return false;
         if (info.failureCount >= MAX_FAILURES_BEFORE_DISABLE) return false;
-        
+
         return true;
     }
 
@@ -770,7 +769,7 @@ contract MonBridgeDex {
         // Check all V2 routers with direct and multi-hop paths
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
-            
+
             // Try direct path first
             uint[] memory amounts;
             try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
@@ -779,7 +778,7 @@ contract MonBridgeDex {
                 continue;
             }
             uint amountOut = amounts[amounts.length - 1];
-            
+
             if (amountOut > bestAmountOut) {
                 bestAmountOut = amountOut;
                 bestRouter = routersV2[i];
@@ -793,7 +792,7 @@ contract MonBridgeDex {
                 wethPath[0] = path[0];
                 wethPath[1] = WETH;
                 wethPath[2] = path[1];
-                
+
                 uint[] memory wethAmounts;
                 try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
                     wethAmounts = res;
@@ -801,7 +800,7 @@ contract MonBridgeDex {
                     continue;
                 }
                 uint wethAmountOut = wethAmounts[wethAmounts.length - 1];
-                
+
                 // If routing through WETH gives better price, use it
                 if (wethAmountOut > bestAmountOut) {
                     bestAmountOut = wethAmountOut;
@@ -812,14 +811,15 @@ contract MonBridgeDex {
             }
         }
 
-        // Check all V3 routers (single hop)
-        if (path.length == 2) {
-            for (uint i = 0; i < routersV3.length; i++) {
-                if (!_validateRouter(routersV3[i])) continue;
-                
-                address factory = v3RouterToFactory[routersV3[i]];
-                if (factory == address(0)) continue;
+        // Check all V3 routers (supports single and multi-hop)
+        for (uint i = 0; i < routersV3.length; i++) {
+            if (!_validateRouter(routersV3[i])) continue;
 
+            address factory = v3RouterToFactory[routersV3[i]];
+            if (factory == address(0)) continue;
+
+            if (path.length == 2) {
+                // Single-hop V3
                 (address bestPool, uint24 bestFee, uint amountOut, uint impact) = _getBestV3Pool(
                     factory,
                     path[0],
@@ -833,6 +833,40 @@ contract MonBridgeDex {
                     bestRouterType = RouterType.V3;
                     bestV3Fee = bestFee;
                     bestPriceImpact = impact;
+                    bestPath = path;
+                }
+            }
+
+            // Also try multi-hop through WETH for token-to-token
+            if (path.length == 2 && path[0] != WETH && path[1] != WETH) {
+                address[] memory wethPath = new address[](3);
+                wethPath[0] = path[0];
+                wethPath[1] = WETH;
+                wethPath[2] = path[1];
+
+                (address pool1, uint24 fee1, uint amountMid, uint impact1) = _getBestV3Pool(
+                    factory,
+                    wethPath[0],
+                    wethPath[1],
+                    amountIn
+                );
+
+                if (pool1 != address(0) && amountMid > 0) {
+                    (address pool2, uint24 fee2, uint amountOut, uint impact2) = _getBestV3Pool(
+                        factory,
+                        wethPath[1],
+                        wethPath[2],
+                        amountMid
+                    );
+
+                    if (pool2 != address(0) && amountOut > bestAmountOut) {
+                        bestAmountOut = amountOut;
+                        bestRouter = routersV3[i];
+                        bestRouterType = RouterType.V3;
+                        bestV3Fee = fee1; // Primary fee tier
+                        bestPriceImpact = impact1 + impact2;
+                        bestPath = wethPath; // Use WETH routing path
+                    }
                 }
             }
         }
@@ -850,7 +884,7 @@ contract MonBridgeDex {
         uint totalExpectedOut
     ) {
         RouterQuote[] memory allQuotes = _getAllRouterQuotes(totalAmountIn / 4, path); // Test with 25% chunks
-        
+
         if (allQuotes.length == 0) {
             return (new RouterQuote[](0), new uint16[](0), 0);
         }
@@ -865,7 +899,7 @@ contract MonBridgeDex {
 
         selectedQuotes = new RouterQuote[](numSplits);
         percentages = new uint16[](numSplits);
-        
+
         // Copy top routers
         for (uint i = 0; i < numSplits; i++) {
             selectedQuotes[i] = allQuotes[i];
@@ -898,13 +932,13 @@ contract MonBridgeDex {
         address[] memory path
     ) internal view returns (uint totalOut) {
         uint numSplits = quotes.length;
-        
+
         // Start with equal distribution
         uint16 equalShare = uint16(10000 / numSplits);
         for (uint i = 0; i < numSplits; i++) {
             percentages[i] = equalShare;
         }
-        
+
         // Adjust last percentage to ensure total = 10000 (100%)
         uint16 totalPct = 0;
         for (uint i = 0; i < numSplits - 1; i++) {
@@ -915,12 +949,12 @@ contract MonBridgeDex {
         // Iterative optimization: shift allocation towards better routers
         for (uint iteration = 0; iteration < 5; iteration++) {
             uint[] memory outputs = new uint[](numSplits);
-            
+
             // Calculate output for each split with current allocation
             for (uint i = 0; i < numSplits; i++) {
                 uint splitAmount = (totalAmount * percentages[i]) / 10000;
                 if (splitAmount == 0) continue;
-                
+
                 if (quotes[i].routerType == RouterType.V2) {
                     try IUniswapV2Router02(quotes[i].router).getAmountsOut(splitAmount, quotes[i].path) returns (uint[] memory amounts) {
                         outputs[i] = amounts[amounts.length - 1];
@@ -974,7 +1008,7 @@ contract MonBridgeDex {
         for (uint i = 0; i < numSplits; i++) {
             uint splitAmount = (totalAmount * percentages[i]) / 10000;
             if (splitAmount == 0) continue;
-            
+
             if (quotes[i].routerType == RouterType.V2) {
                 try IUniswapV2Router02(quotes[i].router).getAmountsOut(splitAmount, quotes[i].path) returns (uint[] memory amounts) {
                     totalOut += amounts[amounts.length - 1];
@@ -1005,7 +1039,7 @@ contract MonBridgeDex {
         uint16 userSlippageBPS
     ) internal view returns (uint256 minAmountOut) {
         uint256 slippageBPS;
-        
+
         if (userSlippageBPS > 0) {
             // User override
             require(userSlippageBPS <= slippageConfig.maxSlippageBPS, "MonBridgeDex: Slippage too high");
@@ -1013,19 +1047,19 @@ contract MonBridgeDex {
         } else {
             // Adaptive calculation
             slippageBPS = slippageConfig.baseSlippageBPS; // Start with base (e.g., 50 = 0.5%)
-            
+
             // Add buffer for high impact trades
             if (priceImpact > 100) { // > 1% impact
                 uint256 additionalSlippage = (priceImpact * slippageConfig.impactMultiplier) / 10000;
                 slippageBPS += additionalSlippage;
             }
-            
+
             // Cap at maximum allowed
             if (slippageBPS > slippageConfig.maxSlippageBPS) {
                 slippageBPS = slippageConfig.maxSlippageBPS;
             }
         }
-        
+
         // Calculate minimum output: amountOut * (1 - slippage%)
         minAmountOut = (amountOut * (10000 - slippageBPS)) / 10000;
     }
@@ -1036,19 +1070,19 @@ contract MonBridgeDex {
         address[] calldata path,
         bool supportFeeOnTransfer,
         uint16 userSlippageBPS
-    ) 
-        external 
-        view 
-        returns (SwapData memory swapData) 
+    )
+        external
+        view
+        returns (SwapData memory swapData)
     {
         require(path.length >= 2, "MonBridgeDex: Invalid path, must have at least 2 tokens");
         require(amountIn > 0, "MonBridgeDex: Amount must be greater than 0");
-        
+
         uint fee = amountIn / FEE_DIVISOR;
         uint amountForSwap = amountIn - fee;
 
         // Find best route (may include WETH routing for V2)
-        (address bestRouter, uint bestAmountOut, RouterType routerType, uint24 v3Fee, uint priceImpact, address[] memory optimalPath) = 
+        (address bestRouter, uint bestAmountOut, RouterType routerType, uint24 v3Fee, uint priceImpact, address[] memory optimalPath) =
             _getBestRouterWithPath(amountForSwap, path);
         require(bestRouter != address(0), "MonBridgeDex: No valid router found for this swap path");
 
@@ -1099,18 +1133,18 @@ contract MonBridgeDex {
         uint amountForSwap = amountIn - fee;
 
         // Calculate optimal splits
-        (RouterQuote[] memory quotes, uint16[] memory percentages, uint totalExpectedOut) = 
+        (RouterQuote[] memory quotes, uint16[] memory percentages, uint totalExpectedOut) =
             _calculateOptimalSplits(amountForSwap, path, splitConfig.maxSplits);
 
         require(quotes.length >= 2, "MonBridgeDex: Insufficient routers for split");
 
         // Build individual swap data for each split
         SwapData[] memory splits = new SwapData[](quotes.length);
-        
+
         for (uint i = 0; i < quotes.length; i++) {
             uint splitAmount = (amountForSwap * percentages[i]) / 10000;
             uint splitAmountWithFee = (amountIn * percentages[i]) / 10000;
-            
+
             // Determine swap type
             SwapType swapType;
             if (quotes[i].path[0] == WETH) {
@@ -1159,14 +1193,14 @@ contract MonBridgeDex {
         // Get V2 quotes (direct path)
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
-            
+
             uint[] memory amounts;
             try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
                 amounts = res;
             } catch {
                 continue;
             }
-            
+
             if (amounts.length > 0 && amounts[amounts.length - 1] > 0) {
                 tempQuotes[quoteCount] = RouterQuote({
                     router: routersV2[i],
@@ -1185,14 +1219,14 @@ contract MonBridgeDex {
                 wethPath[0] = path[0];
                 wethPath[1] = WETH;
                 wethPath[2] = path[1];
-                
+
                 uint[] memory wethAmounts;
                 try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
                     wethAmounts = res;
                 } catch {
                     continue;
                 }
-                
+
                 if (wethAmounts.length > 0 && wethAmounts[wethAmounts.length - 1] > 0) {
                     tempQuotes[quoteCount] = RouterQuote({
                         router: routersV2[i],
@@ -1211,24 +1245,24 @@ contract MonBridgeDex {
         if (path.length == 2) {
             for (uint i = 0; i < routersV3.length; i++) {
                 if (!_validateRouter(routersV3[i])) continue;
-                
+
                 address factory = v3RouterToFactory[routersV3[i]];
                 if (factory == address(0)) continue;
 
                 for (uint j = 0; j < v3FeeTiers.length; j++) {
                     uint24 fee = v3FeeTiers[j];
                     address pool;
-                    
+
                     try IUniswapV3Factory(factory).getPool(path[0], path[1], fee) returns (address p) {
                         pool = p;
                     } catch {
                         continue;
                     }
-                    
+
                     if (pool == address(0)) continue;
-                    
+
                     (uint amountOut, uint impact) = _calculateV3SwapOutput(pool, amountIn, path[0], fee);
-                    
+
                     if (amountOut > 0) {
                         tempQuotes[quoteCount] = RouterQuote({
                             router: routersV3[i],
@@ -1249,7 +1283,7 @@ contract MonBridgeDex {
         for (uint i = 0; i < quoteCount; i++) {
             quotes[i] = tempQuotes[i];
         }
-        
+
         return quotes;
     }
 
@@ -1272,7 +1306,7 @@ contract MonBridgeDex {
         // Check all V2 routers with direct and multi-hop paths
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
-            
+
             // Try direct path
             uint[] memory amounts;
             try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
@@ -1281,7 +1315,7 @@ contract MonBridgeDex {
                 continue;
             }
             uint amountOut = amounts[amounts.length - 1];
-            
+
             if (amountOut > bestAmountOut) {
                 bestAmountOut = amountOut;
                 bestRouter = routersV2[i];
@@ -1296,7 +1330,7 @@ contract MonBridgeDex {
                 wethPath[0] = path[0];
                 wethPath[1] = WETH;
                 wethPath[2] = path[1];
-                
+
                 uint[] memory wethAmounts;
                 try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
                     wethAmounts = res;
@@ -1304,7 +1338,7 @@ contract MonBridgeDex {
                     continue;
                 }
                 uint wethAmountOut = wethAmounts[wethAmounts.length - 1];
-                
+
                 // If routing through WETH gives better price, use it
                 if (wethAmountOut > bestAmountOut) {
                     bestAmountOut = wethAmountOut;
@@ -1316,14 +1350,15 @@ contract MonBridgeDex {
             }
         }
 
-        // Check all V3 routers (single hop only for now)
-        if (path.length == 2) {
-            for (uint i = 0; i < routersV3.length; i++) {
-                if (!_validateRouter(routersV3[i])) continue;
-                
-                address factory = v3RouterToFactory[routersV3[i]];
-                if (factory == address(0)) continue;
+        // Check all V3 routers (supports single and multi-hop)
+        for (uint i = 0; i < routersV3.length; i++) {
+            if (!_validateRouter(routersV3[i])) continue;
 
+            address factory = v3RouterToFactory[routersV3[i]];
+            if (factory == address(0)) continue;
+
+            if (path.length == 2) {
+                // Single-hop V3
                 (address bestPool, uint24 bestFee, uint amountOut, uint impact) = _getBestV3Pool(
                     factory,
                     path[0],
@@ -1337,7 +1372,40 @@ contract MonBridgeDex {
                     bestRouterType = RouterType.V3;
                     bestV3Fee = bestFee;
                     bestPriceImpact = impact;
-                    bestPath = path; // V3 uses original path
+                    bestPath = path;
+                }
+            }
+
+            // Also try multi-hop through WETH for token-to-token
+            if (path.length == 2 && path[0] != WETH && path[1] != WETH) {
+                address[] memory wethPath = new address[](3);
+                wethPath[0] = path[0];
+                wethPath[1] = WETH;
+                wethPath[2] = path[1];
+
+                (address pool1, uint24 fee1, uint amountMid, uint impact1) = _getBestV3Pool(
+                    factory,
+                    wethPath[0],
+                    wethPath[1],
+                    amountIn
+                );
+
+                if (pool1 != address(0) && amountMid > 0) {
+                    (address pool2, uint24 fee2, uint amountOut, uint impact2) = _getBestV3Pool(
+                        factory,
+                        wethPath[1],
+                        wethPath[2],
+                        amountMid
+                    );
+
+                    if (pool2 != address(0) && amountOut > bestAmountOut) {
+                        bestAmountOut = amountOut;
+                        bestRouter = routersV3[i];
+                        bestRouterType = RouterType.V3;
+                        bestV3Fee = fee1; // Primary fee tier
+                        bestPriceImpact = impact1 + impact2;
+                        bestPath = wethPath; // Use WETH routing path
+                    }
                 }
             }
         }
@@ -1353,7 +1421,7 @@ contract MonBridgeDex {
     {
         require(splitData.splits.length >= 2 && splitData.splits.length <= 4, "MonBridgeDex: Invalid split count (2-4)");
         require(splitData.totalAmountIn > 0, "MonBridgeDex: Amount must be greater than 0");
-        
+
         // Validate tokens in all paths
         for (uint i = 0; i < splitData.splits.length; i++) {
             for (uint j = 0; j < splitData.splits[i].path.length; j++) {
@@ -1375,7 +1443,7 @@ contract MonBridgeDex {
         // Execute each split
         for (uint i = 0; i < splitData.splits.length; i++) {
             SwapData memory split = splitData.splits[i];
-            
+
             require(
                 (split.routerType == RouterType.V2 && isRouterV2[split.router]) ||
                 (split.routerType == RouterType.V3 && isRouterV3[split.router]),
@@ -1440,13 +1508,13 @@ contract MonBridgeDex {
     }
 
     /// @notice Execute swap with provided swap data
-    function execute(SwapData calldata swapData) 
-        external 
-        payable 
-        nonReentrant 
+    function execute(SwapData calldata swapData)
+        external
+        payable
+        nonReentrant
         whenNotPaused
         validTokens(swapData.path)
-        returns (uint amountOut) 
+        returns (uint amountOut)
     {
         require(
             (swapData.routerType == RouterType.V2 && isRouterV2[swapData.router]) ||
@@ -1463,7 +1531,7 @@ contract MonBridgeDex {
 
         uint balanceBefore;
         address outputToken = swapData.path[swapData.path.length - 1];
-        
+
         if (swapData.swapType == SwapType.TOKEN_TO_ETH) {
             balanceBefore = msg.sender.balance;
         } else {
@@ -1487,7 +1555,7 @@ contract MonBridgeDex {
         } else {
             balanceAfter = IERC20(outputToken).balanceOf(msg.sender);
         }
-        
+
         uint actualOut = balanceAfter - balanceBefore;
         require(actualOut >= swapData.amountOutMin, "MonBridgeDex: Insufficient output amount, exceeds slippage tolerance");
 
@@ -1505,12 +1573,12 @@ contract MonBridgeDex {
     }
 
     /// @notice Internal swap execution (called via try-catch)
-    function _executeSwapInternal(SwapData calldata swapData, uint amountForSwap, uint fee) 
-        external 
-        returns (uint amountOut) 
+    function _executeSwapInternal(SwapData calldata swapData, uint amountForSwap, uint fee)
+        external
+        returns (uint amountOut)
     {
         require(msg.sender == address(this), "Internal only");
-        
+
         if (swapData.routerType == RouterType.V2) {
             return _executeV2Swap(swapData, amountForSwap, fee);
         } else {
@@ -1523,7 +1591,7 @@ contract MonBridgeDex {
         if (swapData.swapType == SwapType.ETH_TO_TOKEN) {
             require(swapData.path[0] == WETH, "Path must start with WETH");
             require(msg.value == swapData.amountIn, "Incorrect ETH amount");
-            
+
             feeAccumulatedETH += fee;
 
             if (swapData.supportFeeOnTransfer) {
@@ -1545,7 +1613,7 @@ contract MonBridgeDex {
 
         } else if (swapData.swapType == SwapType.TOKEN_TO_ETH) {
             require(swapData.path[swapData.path.length - 1] == WETH, "Path must end with WETH");
-            
+
             require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "MonBridgeDex: Token transfer from user failed");
             feeAccumulatedTokens[swapData.path[0]] += fee;
 
@@ -1603,10 +1671,10 @@ contract MonBridgeDex {
     function _encodeV3Path(address[] memory tokens, uint24[] memory fees) internal pure returns (bytes memory path) {
         require(tokens.length >= 2, "MonBridgeDex: Invalid path length");
         require(tokens.length == fees.length + 1, "MonBridgeDex: Path/fee array mismatch");
-        
+
         // Start with first token
         path = abi.encodePacked(tokens[0]);
-        
+
         // Append each (fee, token) pair
         for (uint i = 0; i < fees.length; i++) {
             path = abi.encodePacked(path, fees[i], tokens[i + 1]);
@@ -1618,7 +1686,7 @@ contract MonBridgeDex {
         if (swapData.swapType == SwapType.ETH_TO_TOKEN) {
             require(swapData.path[0] == WETH, "MonBridgeDex: Path must start with WETH");
             require(msg.value == swapData.amountIn, "MonBridgeDex: Incorrect ETH amount");
-            
+
             feeAccumulatedETH += fee;
 
             // V3 requires WETH, so wrap ETH first
@@ -1640,7 +1708,7 @@ contract MonBridgeDex {
                 amountOut = ISwapRouter(swapData.router).exactInputSingle(params);
             } else {
                 bytes memory path = _encodeV3Path(swapData.path, swapData.v3Fees);
-                
+
                 ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
                     path: path,
                     recipient: msg.sender,
@@ -1654,7 +1722,7 @@ contract MonBridgeDex {
 
         } else if (swapData.swapType == SwapType.TOKEN_TO_ETH) {
             require(swapData.path[swapData.path.length - 1] == WETH, "MonBridgeDex: Path must end with WETH");
-            
+
             require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "MonBridgeDex: Token transfer from user failed");
             feeAccumulatedTokens[swapData.path[0]] += fee;
 
@@ -1675,7 +1743,7 @@ contract MonBridgeDex {
                 amountOut = ISwapRouter(swapData.router).exactInputSingle(params);
             } else {
                 bytes memory path = _encodeV3Path(swapData.path, swapData.v3Fees);
-                
+
                 ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
                     path: path,
                     recipient: address(this),
@@ -1712,7 +1780,7 @@ contract MonBridgeDex {
                 amountOut = ISwapRouter(swapData.router).exactInputSingle(params);
             } else {
                 bytes memory path = _encodeV3Path(swapData.path, swapData.v3Fees);
-                
+
                 ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
                     path: path,
                     recipient: msg.sender,
@@ -1840,13 +1908,13 @@ contract MonBridgeDex {
             reserveIn = reserve1;
             reserveOut = reserve0;
         }
-        
+
         uint idealOutput = (amountIn * reserveOut) / reserveIn;
-        
+
         address[] memory path = getPath(tokenIn, tokenOut);
         uint[] memory amounts = IUniswapV2Router02(router).getAmountsOut(amountIn, path);
         uint actualOutput = amounts[amounts.length - 1];
-        
+
         if (idealOutput > actualOutput) {
             priceImpact = ((idealOutput - actualOutput) * 1e18) / idealOutput;
         } else {
