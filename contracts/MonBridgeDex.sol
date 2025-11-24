@@ -758,13 +758,15 @@ contract MonBridgeDex {
         uint bestAmountOut,
         RouterType bestRouterType,
         uint24 bestV3Fee,
-        uint bestPriceImpact
+        uint bestPriceImpact,
+        address[] memory bestPath
     ) {
         bestAmountOut = 0;
         bestRouter = address(0);
         bestRouterType = RouterType.V2;
         bestV3Fee = 0;
         bestPriceImpact = type(uint).max;
+        bestPath = path;
 
         // Check all V2 routers with direct and multi-hop paths
         for (uint i = 0; i < routersV2.length; i++) {
