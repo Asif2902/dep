@@ -241,6 +241,14 @@ contract MonBridgeDex {
     }
     TWAPConfig public twapConfig;
 
+    // Split trade configuration
+    struct SplitConfig {
+        bool enableAutoSplit;
+        uint16 minSplitImpactBPS; // Minimum impact to trigger split (e.g., 100 = 1%)
+        uint8 maxSplits; // Max number of splits (2-4)
+    }
+    SplitConfig public splitConfig;
+
     // Fee-on-transfer token tracking
     mapping(address => bool) public isFeeOnTransferToken;
     mapping(address => uint256) public lastKnownTransferFee;
@@ -295,6 +303,22 @@ contract MonBridgeDex {
         bool supportFeeOnTransfer;
     }
 
+    struct SplitSwapData {
+        SwapData[] splits;
+        uint totalAmountIn;
+        uint totalAmountOutMin;
+        uint16[] splitPercentages; // basis points (e.g., 5000 = 50%)
+    }
+
+    struct RouterQuote {
+        address router;
+        RouterType routerType;
+        uint24 v3Fee;
+        uint amountOut;
+        uint priceImpact;
+        address[] path;
+    }
+
     uint24[] public v3FeeTiers;
 
     event RouterV2Added(address router);
@@ -311,6 +335,15 @@ contract MonBridgeDex {
         uint fee,
         uint actualSlippage,
         SwapType swapType
+    );
+    event SplitSwapExecuted(
+        address indexed user,
+        address tokenIn,
+        address tokenOut,
+        uint totalAmountIn,
+        uint totalAmountOut,
+        uint splitCount,
+        uint totalFee
     );
     event FeesWithdrawn(address indexed owner, uint ethAmount);
     event TokenFeesWithdrawn(address indexed owner, address token, uint amount);
@@ -340,6 +373,12 @@ contract MonBridgeDex {
             twapInterval: 1800,
             maxPriceDeviationBPS: 500,
             enableTWAPCheck: true
+        });
+
+        splitConfig = SplitConfig({
+            enableAutoSplit: true,
+            minSplitImpactBPS: 100, // Split if impact > 1%
+            maxSplits: 4
         });
     }
 
@@ -799,6 +838,161 @@ contract MonBridgeDex {
         }
     }
 
+    /// @notice Calculate optimal split percentages across multiple routers
+    /// @dev Uses greedy algorithm to find best distribution minimizing total impact
+    function _calculateOptimalSplits(
+        uint totalAmountIn,
+        address[] memory path,
+        uint8 maxSplitsAllowed
+    ) internal view returns (
+        RouterQuote[] memory selectedQuotes,
+        uint16[] memory percentages,
+        uint totalExpectedOut
+    ) {
+        RouterQuote[] memory allQuotes = _getAllRouterQuotes(totalAmountIn / 4, path); // Test with 25% chunks
+        
+        if (allQuotes.length == 0) {
+            return (new RouterQuote[](0), new uint16[](0), 0);
+        }
+
+        // Sort quotes by amountOut descending
+        allQuotes = _sortQuotesByOutput(allQuotes);
+
+        // Determine optimal number of splits (2-4)
+        uint8 numSplits = maxSplitsAllowed > allQuotes.length ? uint8(allQuotes.length) : maxSplitsAllowed;
+        if (numSplits > 4) numSplits = 4;
+        if (numSplits < 2) numSplits = 2;
+
+        selectedQuotes = new RouterQuote[](numSplits);
+        percentages = new uint16[](numSplits);
+        
+        // Copy top routers
+        for (uint i = 0; i < numSplits; i++) {
+            selectedQuotes[i] = allQuotes[i];
+        }
+
+        // Calculate optimal distribution using iterative refinement
+        totalExpectedOut = _optimizeSplitPercentages(selectedQuotes, percentages, totalAmountIn, path);
+    }
+
+    /// @notice Sort quotes by output amount (descending)
+    function _sortQuotesByOutput(RouterQuote[] memory quotes) internal pure returns (RouterQuote[] memory) {
+        uint n = quotes.length;
+        for (uint i = 0; i < n - 1; i++) {
+            for (uint j = 0; j < n - i - 1; j++) {
+                if (quotes[j].amountOut < quotes[j + 1].amountOut) {
+                    RouterQuote memory temp = quotes[j];
+                    quotes[j] = quotes[j + 1];
+                    quotes[j + 1] = temp;
+                }
+            }
+        }
+        return quotes;
+    }
+
+    /// @notice Optimize split percentages to maximize output
+    function _optimizeSplitPercentages(
+        RouterQuote[] memory quotes,
+        uint16[] memory percentages,
+        uint totalAmount,
+        address[] memory path
+    ) internal view returns (uint totalOut) {
+        uint numSplits = quotes.length;
+        
+        // Start with equal distribution
+        uint16 equalShare = uint16(10000 / numSplits);
+        for (uint i = 0; i < numSplits; i++) {
+            percentages[i] = equalShare;
+        }
+        
+        // Adjust last percentage to ensure total = 10000 (100%)
+        uint16 totalPct = 0;
+        for (uint i = 0; i < numSplits - 1; i++) {
+            totalPct += percentages[i];
+        }
+        percentages[numSplits - 1] = 10000 - totalPct;
+
+        // Iterative optimization: shift allocation towards better routers
+        for (uint iteration = 0; iteration < 5; iteration++) {
+            uint[] memory outputs = new uint[](numSplits);
+            
+            // Calculate output for each split with current allocation
+            for (uint i = 0; i < numSplits; i++) {
+                uint splitAmount = (totalAmount * percentages[i]) / 10000;
+                if (splitAmount == 0) continue;
+                
+                if (quotes[i].routerType == RouterType.V2) {
+                    try IUniswapV2Router02(quotes[i].router).getAmountsOut(splitAmount, quotes[i].path) returns (uint[] memory amounts) {
+                        outputs[i] = amounts[amounts.length - 1];
+                    } catch {
+                        outputs[i] = 0;
+                    }
+                } else {
+                    address factory = v3RouterToFactory[quotes[i].router];
+                    address pool;
+                    try IUniswapV3Factory(factory).getPool(path[0], path[1], quotes[i].v3Fee) returns (address p) {
+                        pool = p;
+                    } catch {
+                        continue;
+                    }
+                    (uint out, ) = _calculateV3SwapOutput(pool, splitAmount, path[0], quotes[i].v3Fee);
+                    outputs[i] = out;
+                }
+            }
+
+            // Find router with best marginal return
+            uint bestRouter = 0;
+            uint bestMarginal = 0;
+            for (uint i = 0; i < numSplits; i++) {
+                if (percentages[i] >= 9500) continue; // Don't allocate more than 95% to one router
+                uint marginal = outputs[i] * 10000 / (percentages[i] > 0 ? percentages[i] : 1);
+                if (marginal > bestMarginal) {
+                    bestMarginal = marginal;
+                    bestRouter = i;
+                }
+            }
+
+            // Shift 5% from worst to best (if beneficial)
+            uint worstRouter = 0;
+            uint worstMarginal = type(uint).max;
+            for (uint i = 0; i < numSplits; i++) {
+                if (i == bestRouter || percentages[i] <= 500) continue; // Keep at least 5%
+                uint marginal = outputs[i] * 10000 / percentages[i];
+                if (marginal < worstMarginal) {
+                    worstMarginal = marginal;
+                    worstRouter = i;
+                }
+            }
+
+            if (bestMarginal > worstMarginal && percentages[worstRouter] >= 500) {
+                percentages[worstRouter] -= 500;
+                percentages[bestRouter] += 500;
+            }
+        }
+
+        // Calculate final expected output
+        for (uint i = 0; i < numSplits; i++) {
+            uint splitAmount = (totalAmount * percentages[i]) / 10000;
+            if (splitAmount == 0) continue;
+            
+            if (quotes[i].routerType == RouterType.V2) {
+                try IUniswapV2Router02(quotes[i].router).getAmountsOut(splitAmount, quotes[i].path) returns (uint[] memory amounts) {
+                    totalOut += amounts[amounts.length - 1];
+                } catch {}
+            } else {
+                address factory = v3RouterToFactory[quotes[i].router];
+                address pool;
+                try IUniswapV3Factory(factory).getPool(path[0], path[1], quotes[i].v3Fee) returns (address p) {
+                    pool = p;
+                } catch {
+                    continue;
+                }
+                (uint out, ) = _calculateV3SwapOutput(pool, splitAmount, path[0], quotes[i].v3Fee);
+                totalOut += out;
+            }
+        }
+    }
+
     /// @notice Calculate adaptive slippage based on price impact
     /// @dev For high impact (>1%), adds proportional slippage buffer
     /// @param amountOut Expected output amount
@@ -884,6 +1078,179 @@ contract MonBridgeDex {
             deadline: block.timestamp + 300,
             supportFeeOnTransfer: supportFeeOnTransfer
         });
+    }
+
+    /// @notice Get split swap data with automatic distribution across 2-4 routers
+    function getSplitSwapData(
+        uint amountIn,
+        address[] calldata path,
+        bool supportFeeOnTransfer,
+        uint16 userSlippageBPS
+    )
+        external
+        view
+        returns (SplitSwapData memory splitData)
+    {
+        require(path.length >= 2, "MonBridgeDex: Invalid path, must have at least 2 tokens");
+        require(amountIn > 0, "MonBridgeDex: Amount must be greater than 0");
+        require(splitConfig.enableAutoSplit, "MonBridgeDex: Auto-split disabled");
+
+        uint fee = amountIn / FEE_DIVISOR;
+        uint amountForSwap = amountIn - fee;
+
+        // Calculate optimal splits
+        (RouterQuote[] memory quotes, uint16[] memory percentages, uint totalExpectedOut) = 
+            _calculateOptimalSplits(amountForSwap, path, splitConfig.maxSplits);
+
+        require(quotes.length >= 2, "MonBridgeDex: Insufficient routers for split");
+
+        // Build individual swap data for each split
+        SwapData[] memory splits = new SwapData[](quotes.length);
+        
+        for (uint i = 0; i < quotes.length; i++) {
+            uint splitAmount = (amountForSwap * percentages[i]) / 10000;
+            uint splitAmountWithFee = (amountIn * percentages[i]) / 10000;
+            
+            // Determine swap type
+            SwapType swapType;
+            if (quotes[i].path[0] == WETH) {
+                swapType = SwapType.ETH_TO_TOKEN;
+            } else if (quotes[i].path[quotes[i].path.length - 1] == WETH) {
+                swapType = SwapType.TOKEN_TO_ETH;
+            } else {
+                swapType = SwapType.TOKEN_TO_TOKEN;
+            }
+
+            uint24[] memory v3Fees = new uint24[](1);
+            v3Fees[0] = quotes[i].v3Fee;
+
+            uint splitExpectedOut = (quotes[i].amountOut * percentages[i]) / 10000;
+            uint splitMinOut = _calculateAdaptiveSlippage(splitExpectedOut, quotes[i].priceImpact, userSlippageBPS);
+
+            splits[i] = SwapData({
+                swapType: swapType,
+                routerType: quotes[i].routerType,
+                router: quotes[i].router,
+                path: quotes[i].path,
+                v3Fees: v3Fees,
+                amountIn: splitAmountWithFee,
+                amountOutMin: splitMinOut,
+                deadline: block.timestamp + 300,
+                supportFeeOnTransfer: supportFeeOnTransfer
+            });
+        }
+
+        uint totalMinOut = _calculateAdaptiveSlippage(totalExpectedOut, 0, userSlippageBPS);
+
+        splitData = SplitSwapData({
+            splits: splits,
+            totalAmountIn: amountIn,
+            totalAmountOutMin: totalMinOut,
+            splitPercentages: percentages
+        });
+    }
+
+    /// @notice Get quotes from all available routers
+    function _getAllRouterQuotes(uint amountIn, address[] memory path) internal view returns (RouterQuote[] memory) {
+        uint maxQuotes = routersV2.length + routersV3.length * 2; // V3 may have multiple fee tiers
+        RouterQuote[] memory tempQuotes = new RouterQuote[](maxQuotes);
+        uint quoteCount = 0;
+
+        // Get V2 quotes (direct path)
+        for (uint i = 0; i < routersV2.length; i++) {
+            if (!_validateRouter(routersV2[i])) continue;
+            
+            uint[] memory amounts;
+            try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
+                amounts = res;
+            } catch {
+                continue;
+            }
+            
+            if (amounts.length > 0 && amounts[amounts.length - 1] > 0) {
+                tempQuotes[quoteCount] = RouterQuote({
+                    router: routersV2[i],
+                    routerType: RouterType.V2,
+                    v3Fee: 0,
+                    amountOut: amounts[amounts.length - 1],
+                    priceImpact: 0,
+                    path: path
+                });
+                quoteCount++;
+            }
+
+            // Try WETH routing for token-to-token
+            if (path.length == 2 && path[0] != WETH && path[1] != WETH) {
+                address[] memory wethPath = new address[](3);
+                wethPath[0] = path[0];
+                wethPath[1] = WETH;
+                wethPath[2] = path[1];
+                
+                uint[] memory wethAmounts;
+                try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
+                    wethAmounts = res;
+                } catch {
+                    continue;
+                }
+                
+                if (wethAmounts.length > 0 && wethAmounts[wethAmounts.length - 1] > 0) {
+                    tempQuotes[quoteCount] = RouterQuote({
+                        router: routersV2[i],
+                        routerType: RouterType.V2,
+                        v3Fee: 0,
+                        amountOut: wethAmounts[wethAmounts.length - 1],
+                        priceImpact: 0,
+                        path: wethPath
+                    });
+                    quoteCount++;
+                }
+            }
+        }
+
+        // Get V3 quotes (single hop only)
+        if (path.length == 2) {
+            for (uint i = 0; i < routersV3.length; i++) {
+                if (!_validateRouter(routersV3[i])) continue;
+                
+                address factory = v3RouterToFactory[routersV3[i]];
+                if (factory == address(0)) continue;
+
+                for (uint j = 0; j < v3FeeTiers.length; j++) {
+                    uint24 fee = v3FeeTiers[j];
+                    address pool;
+                    
+                    try IUniswapV3Factory(factory).getPool(path[0], path[1], fee) returns (address p) {
+                        pool = p;
+                    } catch {
+                        continue;
+                    }
+                    
+                    if (pool == address(0)) continue;
+                    
+                    (uint amountOut, uint impact) = _calculateV3SwapOutput(pool, amountIn, path[0], fee);
+                    
+                    if (amountOut > 0) {
+                        tempQuotes[quoteCount] = RouterQuote({
+                            router: routersV3[i],
+                            routerType: RouterType.V3,
+                            v3Fee: fee,
+                            amountOut: amountOut,
+                            priceImpact: impact,
+                            path: path
+                        });
+                        quoteCount++;
+                    }
+                }
+            }
+        }
+
+        // Resize array to actual count
+        RouterQuote[] memory quotes = new RouterQuote[](quoteCount);
+        for (uint i = 0; i < quoteCount; i++) {
+            quotes[i] = tempQuotes[i];
+        }
+        
+        return quotes;
     }
 
     /// @notice Find best router with optimal path including V2 WETH routing
@@ -974,6 +1341,102 @@ contract MonBridgeDex {
                 }
             }
         }
+    }
+
+    /// @notice Execute split swap across multiple routers
+    function executeSplit(SplitSwapData calldata splitData)
+        external
+        payable
+        nonReentrant
+        whenNotPaused
+        returns (uint totalAmountOut)
+    {
+        require(splitData.splits.length >= 2 && splitData.splits.length <= 4, "MonBridgeDex: Invalid split count (2-4)");
+        require(splitData.totalAmountIn > 0, "MonBridgeDex: Amount must be greater than 0");
+        
+        // Validate tokens in all paths
+        for (uint i = 0; i < splitData.splits.length; i++) {
+            for (uint j = 0; j < splitData.splits[i].path.length; j++) {
+                require(!tokenBlacklist[splitData.splits[i].path[j]], "MonBridgeDex: Token blacklisted");
+            }
+        }
+
+        uint totalFee = splitData.totalAmountIn / FEE_DIVISOR;
+        address outputToken = splitData.splits[0].path[splitData.splits[0].path.length - 1];
+        SwapType swapType = splitData.splits[0].swapType;
+
+        uint balanceBefore;
+        if (swapType == SwapType.TOKEN_TO_ETH) {
+            balanceBefore = msg.sender.balance;
+        } else {
+            balanceBefore = IERC20(outputToken).balanceOf(msg.sender);
+        }
+
+        // Execute each split
+        for (uint i = 0; i < splitData.splits.length; i++) {
+            SwapData memory split = splitData.splits[i];
+            
+            require(
+                (split.routerType == RouterType.V2 && isRouterV2[split.router]) ||
+                (split.routerType == RouterType.V3 && isRouterV3[split.router]),
+                "MonBridgeDex: Router not whitelisted"
+            );
+            require(_validateRouter(split.router), "MonBridgeDex: Router unhealthy");
+
+            uint splitFee = split.amountIn / FEE_DIVISOR;
+            uint amountForSwap = split.amountIn - splitFee;
+
+            try this._executeSwapInternal(split, amountForSwap, splitFee) {
+                _recordSwapSuccess(split.router, amountForSwap);
+            } catch Error(string memory reason) {
+                _recordSwapFailure(split.router);
+                revert(string(abi.encodePacked("MonBridgeDex: Split ", uint2str(i), " failed - ", reason)));
+            } catch {
+                _recordSwapFailure(split.router);
+                revert(string(abi.encodePacked("MonBridgeDex: Split ", uint2str(i), " failed")));
+            }
+        }
+
+        uint balanceAfter;
+        if (swapType == SwapType.TOKEN_TO_ETH) {
+            balanceAfter = msg.sender.balance;
+        } else {
+            balanceAfter = IERC20(outputToken).balanceOf(msg.sender);
+        }
+
+        totalAmountOut = balanceAfter - balanceBefore;
+        require(totalAmountOut >= splitData.totalAmountOutMin, "MonBridgeDex: Insufficient total output");
+
+        emit SplitSwapExecuted(
+            msg.sender,
+            splitData.splits[0].path[0],
+            outputToken,
+            splitData.totalAmountIn,
+            totalAmountOut,
+            splitData.splits.length,
+            totalFee
+        );
+    }
+
+    /// @notice Helper to convert uint to string
+    function uint2str(uint _i) internal pure returns (string memory) {
+        if (_i == 0) return "0";
+        uint j = _i;
+        uint len;
+        while (j != 0) {
+            len++;
+            j /= 10;
+        }
+        bytes memory bstr = new bytes(len);
+        uint k = len;
+        while (_i != 0) {
+            k = k-1;
+            uint8 temp = (48 + uint8(_i - _i / 10 * 10));
+            bytes1 b1 = bytes1(temp);
+            bstr[k] = b1;
+            _i /= 10;
+        }
+        return string(bstr);
     }
 
     /// @notice Execute swap with provided swap data
@@ -1318,6 +1781,20 @@ contract MonBridgeDex {
             twapInterval: _twapInterval,
             maxPriceDeviationBPS: _maxPriceDeviationBPS,
             enableTWAPCheck: _enableTWAPCheck
+        });
+    }
+
+    /// @notice Update split trade configuration
+    function updateSplitConfig(
+        bool _enableAutoSplit,
+        uint16 _minSplitImpactBPS,
+        uint8 _maxSplits
+    ) external onlyOwner {
+        require(_maxSplits >= 2 && _maxSplits <= 4, "MonBridgeDex: Max splits must be 2-4");
+        splitConfig = SplitConfig({
+            enableAutoSplit: _enableAutoSplit,
+            minSplitImpactBPS: _minSplitImpactBPS,
+            maxSplits: _maxSplits
         });
     }
 
