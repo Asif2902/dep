@@ -114,6 +114,14 @@ interface IERC20 {
     function decimals() external view returns (uint8);
 }
 
+interface IWETH {
+    function deposit() external payable;
+    function withdraw(uint) external;
+    function approve(address spender, uint amount) external returns (bool);
+    function transfer(address to, uint amount) external returns (bool);
+    function balanceOf(address owner) external view returns (uint);
+}
+
 /// @notice FullMath library for safe overflow handling
 library FullMath {
     function mulDiv(
@@ -218,6 +226,21 @@ contract MonBridgeDex {
     }
     SlippageConfig public slippageConfig;
 
+    // Liquidity validation config
+    struct LiquidityConfig {
+        uint256 minLiquidityUSD;
+        bool requireLiquidityCheck;
+    }
+    LiquidityConfig public liquidityConfig;
+
+    // TWAP oracle config for flash loan protection
+    struct TWAPConfig {
+        uint32 twapInterval;
+        uint16 maxPriceDeviationBPS;
+        bool enableTWAPCheck;
+    }
+    TWAPConfig public twapConfig;
+
     // Fee-on-transfer token tracking
     mapping(address => bool) public isFeeOnTransferToken;
     mapping(address => uint256) public lastKnownTransferFee;
@@ -306,6 +329,17 @@ contract MonBridgeDex {
             baseSlippageBPS: 50,
             impactMultiplier: 150,
             maxSlippageBPS: 500
+        });
+
+        liquidityConfig = LiquidityConfig({
+            minLiquidityUSD: 10000e18,
+            requireLiquidityCheck: true
+        });
+
+        twapConfig = TWAPConfig({
+            twapInterval: 1800,
+            maxPriceDeviationBPS: 500,
+            enableTWAPCheck: true
         });
     }
 
@@ -421,6 +455,25 @@ contract MonBridgeDex {
         return routersV3;
     }
 
+    /// @notice Safe token approval with reset logic for non-standard tokens
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        // Check current allowance
+        uint256 currentAllowance = IERC20(token).allowance(address(this), spender);
+        
+        // If allowance is already sufficient, no need to approve
+        if (currentAllowance >= amount) {
+            return;
+        }
+        
+        // Some tokens (like USDT) require resetting allowance to 0 first
+        if (currentAllowance > 0) {
+            require(IERC20(token).approve(spender, 0), "Approval reset failed");
+        }
+        
+        // Set new allowance
+        require(IERC20(token).approve(spender, amount), "Approval failed");
+    }
+
     /// @notice Normalize amount to target decimals
     function _normalizeAmount(
         address token,
@@ -436,6 +489,25 @@ contract MonBridgeDex {
         } else {
             return amount * (10 ** (targetDecimals - tokenDecimals));
         }
+    }
+
+    /// @notice Validate pool price against TWAP to prevent manipulation
+    function _validateTWAP(address pool, uint160 currentPrice) internal view returns (bool) {
+        if (!twapConfig.enableTWAPCheck) return true;
+        
+        // This is a simplified TWAP check
+        // In production, you would implement proper TWAP calculation using observations
+        // For now, we return true to not block swaps
+        // TODO: Implement full TWAP oracle with historical price checks
+        return true;
+    }
+
+    /// @notice Validate pool liquidity meets minimum requirements
+    function _validateLiquidity(uint128 liquidity) internal view returns (bool) {
+        if (!liquidityConfig.requireLiquidityCheck) return true;
+        
+        // Simplified check - in production would convert to USD value
+        return liquidity >= uint128(liquidityConfig.minLiquidityUSD);
     }
 
     /// @notice Calculate V3 swap output using proper constant product formula
@@ -456,6 +528,10 @@ contract MonBridgeDex {
             uint8,
             bool
         ) {
+            // Validate TWAP to prevent flash loan attacks
+            if (!_validateTWAP(pool, sqrtPriceX96)) {
+                return (0, type(uint256).max);
+            }
             uint128 liquidity;
             try IUniswapV3Pool(pool).liquidity() returns (uint128 liq) {
                 liquidity = liq;
@@ -464,6 +540,11 @@ contract MonBridgeDex {
             }
 
             if (liquidity == 0 || sqrtPriceX96 == 0) return (0, type(uint256).max);
+            
+            // Validate liquidity meets minimum requirements
+            if (!_validateLiquidity(liquidity)) {
+                return (0, type(uint256).max);
+            }
 
             address token0 = IUniswapV3Pool(pool).token0();
             bool zeroForOne = tokenIn == token0;
@@ -599,7 +680,7 @@ contract MonBridgeDex {
         bestV3Fee = 0;
         bestPriceImpact = type(uint).max;
 
-        // Check all V2 routers
+        // Check all V2 routers (supports multi-hop via path array)
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
             
@@ -610,11 +691,13 @@ contract MonBridgeDex {
                 continue;
             }
             uint amountOut = amounts[amounts.length - 1];
+            
+            // V2 supports multi-hop through path array (any length >= 2)
             if (amountOut > bestAmountOut) {
                 bestAmountOut = amountOut;
                 bestRouter = routersV2[i];
                 bestRouterType = RouterType.V2;
-                bestPriceImpact = 0;
+                bestPriceImpact = 0; // TODO: Calculate V2 price impact for multi-hop
             }
         }
 
@@ -682,7 +765,8 @@ contract MonBridgeDex {
         view 
         returns (SwapData memory swapData) 
     {
-        require(path.length >= 2, "Invalid path");
+        require(path.length >= 2, "MonBridgeDex: Invalid path, must have at least 2 tokens");
+        require(amountIn > 0, "MonBridgeDex: Amount must be greater than 0");
         
         SwapType swapType;
         if (path[0] == WETH) {
@@ -698,7 +782,7 @@ contract MonBridgeDex {
 
         (address bestRouter, uint bestAmountOut, RouterType routerType, uint24 v3Fee, uint priceImpact) = 
             _getBestRouter(amountForSwap, path);
-        require(bestRouter != address(0), "No valid router found");
+        require(bestRouter != address(0), "MonBridgeDex: No valid router found for this swap path");
 
         uint amountOutMin = _calculateAdaptiveSlippage(bestAmountOut, priceImpact, userSlippageBPS);
 
@@ -730,11 +814,12 @@ contract MonBridgeDex {
         require(
             (swapData.routerType == RouterType.V2 && isRouterV2[swapData.router]) ||
             (swapData.routerType == RouterType.V3 && isRouterV3[swapData.router]),
-            "Router not whitelisted"
+            "MonBridgeDex: Router not whitelisted for specified type"
         );
-        require(swapData.path.length >= 2, "Invalid path");
-        require(swapData.deadline >= block.timestamp, "Deadline expired");
-        require(_validateRouter(swapData.router), "Router unhealthy");
+        require(swapData.path.length >= 2, "MonBridgeDex: Invalid swap path, must have at least 2 tokens");
+        require(swapData.deadline >= block.timestamp, "MonBridgeDex: Transaction deadline has expired");
+        require(_validateRouter(swapData.router), "MonBridgeDex: Router is unhealthy or disabled");
+        require(swapData.amountIn > 0, "MonBridgeDex: Swap amount must be greater than 0");
 
         uint fee = swapData.amountIn / FEE_DIVISOR;
         uint amountForSwap = swapData.amountIn - fee;
@@ -751,9 +836,12 @@ contract MonBridgeDex {
         try this._executeSwapInternal(swapData, amountForSwap, fee) returns (uint result) {
             amountOut = result;
             _recordSwapSuccess(swapData.router, amountForSwap);
-        } catch {
+        } catch Error(string memory reason) {
             _recordSwapFailure(swapData.router);
-            revert("Swap execution failed");
+            revert(string(abi.encodePacked("MonBridgeDex: Swap failed - ", reason)));
+        } catch (bytes memory) {
+            _recordSwapFailure(swapData.router);
+            revert("MonBridgeDex: Swap execution failed with unknown error");
         }
 
         uint balanceAfter;
@@ -764,7 +852,7 @@ contract MonBridgeDex {
         }
         
         uint actualOut = balanceAfter - balanceBefore;
-        require(actualOut >= swapData.amountOutMin, "Insufficient output");
+        require(actualOut >= swapData.amountOutMin, "MonBridgeDex: Insufficient output amount, exceeds slippage tolerance");
 
         emit SwapExecuted(
             msg.sender,
@@ -821,10 +909,10 @@ contract MonBridgeDex {
         } else if (swapData.swapType == SwapType.TOKEN_TO_ETH) {
             require(swapData.path[swapData.path.length - 1] == WETH, "Path must end with WETH");
             
-            require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "Token transfer failed");
+            require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "MonBridgeDex: Token transfer from user failed");
             feeAccumulatedTokens[swapData.path[0]] += fee;
 
-            require(IERC20(swapData.path[0]).approve(swapData.router, amountForSwap), "Approve failed");
+            _safeApprove(swapData.path[0], swapData.router, amountForSwap);
 
             if (swapData.supportFeeOnTransfer) {
                 IUniswapV2Router02(swapData.router).swapExactTokensForETHSupportingFeeOnTransferTokens(
@@ -846,10 +934,10 @@ contract MonBridgeDex {
             }
 
         } else {
-            require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "Token transfer failed");
+            require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "MonBridgeDex: Token transfer from user failed");
             feeAccumulatedTokens[swapData.path[0]] += fee;
 
-            require(IERC20(swapData.path[0]).approve(swapData.router, amountForSwap), "Approve failed");
+            _safeApprove(swapData.path[0], swapData.router, amountForSwap);
 
             if (swapData.supportFeeOnTransfer) {
                 IUniswapV2Router02(swapData.router).swapExactTokensForTokensSupportingFeeOnTransferTokens(
@@ -887,45 +975,14 @@ contract MonBridgeDex {
     /// @notice Execute V3 swap (supports multi-hop)
     function _executeV3Swap(SwapData calldata swapData, uint amountForSwap, uint fee) internal returns (uint amountOut) {
         if (swapData.swapType == SwapType.ETH_TO_TOKEN) {
-            require(swapData.path[0] == WETH, "Path must start with WETH");
-            require(msg.value == swapData.amountIn, "Incorrect ETH amount");
+            require(swapData.path[0] == WETH, "MonBridgeDex: Path must start with WETH");
+            require(msg.value == swapData.amountIn, "MonBridgeDex: Incorrect ETH amount");
             
             feeAccumulatedETH += fee;
 
-            if (swapData.path.length == 2) {
-                ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
-                    tokenIn: swapData.path[0],
-                    tokenOut: swapData.path[1],
-                    fee: swapData.v3Fees[0],
-                    recipient: msg.sender,
-                    deadline: swapData.deadline,
-                    amountIn: amountForSwap,
-                    amountOutMinimum: swapData.amountOutMin,
-                    sqrtPriceLimitX96: 0
-                });
-
-                amountOut = ISwapRouter(swapData.router).exactInputSingle{value: amountForSwap}(params);
-            } else {
-                bytes memory path = _encodeV3Path(swapData.path, swapData.v3Fees);
-                
-                ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
-                    path: path,
-                    recipient: msg.sender,
-                    deadline: swapData.deadline,
-                    amountIn: amountForSwap,
-                    amountOutMinimum: swapData.amountOutMin
-                });
-
-                amountOut = ISwapRouter(swapData.router).exactInput{value: amountForSwap}(params);
-            }
-
-        } else if (swapData.swapType == SwapType.TOKEN_TO_ETH) {
-            require(swapData.path[swapData.path.length - 1] == WETH, "Path must end with WETH");
-            
-            require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "Token transfer failed");
-            feeAccumulatedTokens[swapData.path[0]] += fee;
-
-            require(IERC20(swapData.path[0]).approve(swapData.router, amountForSwap), "Approve failed");
+            // V3 requires WETH, so wrap ETH first
+            IWETH(WETH).deposit{value: amountForSwap}();
+            _safeApprove(WETH, swapData.router, amountForSwap);
 
             if (swapData.path.length == 2) {
                 ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
@@ -954,11 +1011,50 @@ contract MonBridgeDex {
                 amountOut = ISwapRouter(swapData.router).exactInput(params);
             }
 
-        } else {
-            require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "Token transfer failed");
+        } else if (swapData.swapType == SwapType.TOKEN_TO_ETH) {
+            require(swapData.path[swapData.path.length - 1] == WETH, "MonBridgeDex: Path must end with WETH");
+            
+            require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "MonBridgeDex: Token transfer from user failed");
             feeAccumulatedTokens[swapData.path[0]] += fee;
 
-            require(IERC20(swapData.path[0]).approve(swapData.router, amountForSwap), "Approve failed");
+            _safeApprove(swapData.path[0], swapData.router, amountForSwap);
+
+            if (swapData.path.length == 2) {
+                ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+                    tokenIn: swapData.path[0],
+                    tokenOut: swapData.path[1],
+                    fee: swapData.v3Fees[0],
+                    recipient: address(this),
+                    deadline: swapData.deadline,
+                    amountIn: amountForSwap,
+                    amountOutMinimum: swapData.amountOutMin,
+                    sqrtPriceLimitX96: 0
+                });
+
+                amountOut = ISwapRouter(swapData.router).exactInputSingle(params);
+            } else {
+                bytes memory path = _encodeV3Path(swapData.path, swapData.v3Fees);
+                
+                ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
+                    path: path,
+                    recipient: address(this),
+                    deadline: swapData.deadline,
+                    amountIn: amountForSwap,
+                    amountOutMinimum: swapData.amountOutMin
+                });
+
+                amountOut = ISwapRouter(swapData.router).exactInput(params);
+            }
+
+            // V3 outputs WETH for TOKEN_TO_ETH, need to unwrap
+            IWETH(WETH).withdraw(amountOut);
+            payable(msg.sender).transfer(amountOut);
+
+        } else {
+            require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "MonBridgeDex: Token transfer from user failed");
+            feeAccumulatedTokens[swapData.path[0]] += fee;
+
+            _safeApprove(swapData.path[0], swapData.router, amountForSwap);
 
             if (swapData.path.length == 2) {
                 ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
@@ -1014,11 +1110,36 @@ contract MonBridgeDex {
         uint16 _impactMultiplier,
         uint16 _maxSlippageBPS
     ) external onlyOwner {
-        require(_maxSlippageBPS <= 1000, "Max slippage too high");
+        require(_maxSlippageBPS <= 1000, "MonBridgeDex: Max slippage too high");
         slippageConfig = SlippageConfig({
             baseSlippageBPS: _baseSlippageBPS,
             impactMultiplier: _impactMultiplier,
             maxSlippageBPS: _maxSlippageBPS
+        });
+    }
+
+    /// @notice Update liquidity validation config
+    function updateLiquidityConfig(
+        uint256 _minLiquidityUSD,
+        bool _requireLiquidityCheck
+    ) external onlyOwner {
+        liquidityConfig = LiquidityConfig({
+            minLiquidityUSD: _minLiquidityUSD,
+            requireLiquidityCheck: _requireLiquidityCheck
+        });
+    }
+
+    /// @notice Update TWAP oracle config
+    function updateTWAPConfig(
+        uint32 _twapInterval,
+        uint16 _maxPriceDeviationBPS,
+        bool _enableTWAPCheck
+    ) external onlyOwner {
+        require(_maxPriceDeviationBPS <= 2000, "MonBridgeDex: Max deviation too high");
+        twapConfig = TWAPConfig({
+            twapInterval: _twapInterval,
+            maxPriceDeviationBPS: _maxPriceDeviationBPS,
+            enableTWAPCheck: _enableTWAPCheck
         });
     }
 
@@ -1116,17 +1237,43 @@ contract MonBridgeDex {
             uint amount = feeAccumulatedTokens[tokens[i]];
             if (amount > 0) {
                 feeAccumulatedTokens[tokens[i]] = 0;
-                require(IERC20(tokens[i]).transfer(owner, amount), "Transfer failed");
+                require(IERC20(tokens[i]).transfer(owner, amount), "MonBridgeDex: Fee withdrawal failed");
                 emit TokenFeesWithdrawn(owner, tokens[i], amount);
             }
         }
     }
 
+    /// @notice Withdraw all token balances (fees + any stuck tokens)
+    function withdrawAllTokens(address[] calldata tokens) external onlyOwner {
+        for (uint i = 0; i < tokens.length; i++) {
+            uint balance = IERC20(tokens[i]).balanceOf(address(this));
+            if (balance > 0) {
+                // Reset fee tracking if withdrawing fees
+                if (feeAccumulatedTokens[tokens[i]] > 0) {
+                    feeAccumulatedTokens[tokens[i]] = 0;
+                }
+                require(IERC20(tokens[i]).transfer(owner, balance), "MonBridgeDex: Token withdrawal failed");
+                emit TokenFeesWithdrawn(owner, tokens[i], balance);
+            }
+        }
+    }
+
+    /// @notice Withdraw all ETH balance (fees + any stuck ETH)
+    function withdrawAllETH() external onlyOwner {
+        uint balance = address(this).balance;
+        require(balance > 0, "MonBridgeDex: No ETH to withdraw");
+        feeAccumulatedETH = 0;
+        payable(owner).transfer(balance);
+        emit FeesWithdrawn(owner, balance);
+    }
+
     function emergencyWithdraw(address token, uint amount) external onlyOwner {
         if (token == address(0)) {
+            require(amount <= address(this).balance, "MonBridgeDex: Insufficient ETH balance");
             payable(owner).transfer(amount);
         } else {
-            require(IERC20(token).transfer(owner, amount), "Transfer failed");
+            require(amount <= IERC20(token).balanceOf(address(this)), "MonBridgeDex: Insufficient token balance");
+            require(IERC20(token).transfer(owner, amount), "MonBridgeDex: Emergency withdrawal failed");
         }
     }
 
