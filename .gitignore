@@ -1,0 +1,25 @@
+# Hardhat
+node_modules/
+cache/
+artifacts/
+coverage/
+typechain-types/
+.hardhat/
+
+# NPM
+package-lock.json
+yarn.lock
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+/tmp/
