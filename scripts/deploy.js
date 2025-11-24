@@ -13,7 +13,11 @@ async function main() {
   // Deploy contract
   console.log("⏳ Deploying MonBridgeDex contract...");
   const MonBridgeDex = await hre.ethers.getContractFactory("MonBridgeDex");
-  const monBridgeDex = await MonBridgeDex.deploy();
+  
+  // WETH address on Monad (may need to update if different)
+  const WETH_ADDRESS = "0x0000000000000000000000000000000000000000"; // Update with actual WETH on Monad
+  
+  const monBridgeDex = await MonBridgeDex.deploy(WETH_ADDRESS);
 
   await monBridgeDex.waitForDeployment();
   const contractAddress = await monBridgeDex.getAddress();

@@ -28,7 +28,7 @@ module.exports = {
     },
     monad: {
       url: MONAD_RPC_URL,
-      chainId: 10143, // Monad testnet chain ID
+      chainId: 143, // Monad mainnet chain ID
       accounts: PRIVATE_KEY ? [PRIVATE_KEY] : [],
       timeout: 60000,
       gasPrice: "auto"
