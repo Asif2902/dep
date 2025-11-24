@@ -287,7 +287,7 @@ contract MonBridgeDex {
         SwapType swapType;
         RouterType routerType;
         address router;
-        address[] path;
+        address[] path; // Full path for both V2 and V3 (V2 supports any length, V3 encoded separately)
         uint24[] v3Fees; // For multi-hop V3
         uint amountIn;
         uint amountOutMin;
@@ -680,10 +680,11 @@ contract MonBridgeDex {
         bestV3Fee = 0;
         bestPriceImpact = type(uint).max;
 
-        // Check all V2 routers (supports multi-hop via path array)
+        // Check all V2 routers with direct and multi-hop paths
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
             
+            // Try direct path first
             uint[] memory amounts;
             try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
                 amounts = res;
@@ -692,12 +693,35 @@ contract MonBridgeDex {
             }
             uint amountOut = amounts[amounts.length - 1];
             
-            // V2 supports multi-hop through path array (any length >= 2)
             if (amountOut > bestAmountOut) {
                 bestAmountOut = amountOut;
                 bestRouter = routersV2[i];
                 bestRouterType = RouterType.V2;
                 bestPriceImpact = 0; // TODO: Calculate V2 price impact for multi-hop
+            }
+
+            // For token-to-token swaps (not involving WETH), try routing through WETH
+            if (path.length == 2 && path[0] != WETH && path[1] != WETH) {
+                address[] memory wethPath = new address[](3);
+                wethPath[0] = path[0];
+                wethPath[1] = WETH;
+                wethPath[2] = path[1];
+                
+                uint[] memory wethAmounts;
+                try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
+                    wethAmounts = res;
+                } catch {
+                    continue;
+                }
+                uint wethAmountOut = wethAmounts[wethAmounts.length - 1];
+                
+                // If routing through WETH gives better price, use it
+                if (wethAmountOut > bestAmountOut) {
+                    bestAmountOut = wethAmountOut;
+                    bestRouter = routersV2[i];
+                    bestRouterType = RouterType.V2;
+                    bestPriceImpact = 0;
+                }
             }
         }
 
@@ -754,7 +778,7 @@ contract MonBridgeDex {
         minAmountOut = (amountOut * (10000 - slippageBPS)) / 10000;
     }
 
-    /// @notice Get the best swap data with adaptive slippage
+    /// @notice Get the best swap data with adaptive slippage and optimal routing
     function getBestSwapData(
         uint amountIn,
         address[] calldata path,
@@ -768,21 +792,23 @@ contract MonBridgeDex {
         require(path.length >= 2, "MonBridgeDex: Invalid path, must have at least 2 tokens");
         require(amountIn > 0, "MonBridgeDex: Amount must be greater than 0");
         
+        uint fee = amountIn / FEE_DIVISOR;
+        uint amountForSwap = amountIn - fee;
+
+        // Find best route (may include WETH routing for V2)
+        (address bestRouter, uint bestAmountOut, RouterType routerType, uint24 v3Fee, uint priceImpact, address[] memory optimalPath) = 
+            _getBestRouterWithPath(amountForSwap, path);
+        require(bestRouter != address(0), "MonBridgeDex: No valid router found for this swap path");
+
+        // Determine swap type based on optimal path
         SwapType swapType;
-        if (path[0] == WETH) {
+        if (optimalPath[0] == WETH) {
             swapType = SwapType.ETH_TO_TOKEN;
-        } else if (path[path.length - 1] == WETH) {
+        } else if (optimalPath[optimalPath.length - 1] == WETH) {
             swapType = SwapType.TOKEN_TO_ETH;
         } else {
             swapType = SwapType.TOKEN_TO_TOKEN;
         }
-
-        uint fee = amountIn / FEE_DIVISOR;
-        uint amountForSwap = amountIn - fee;
-
-        (address bestRouter, uint bestAmountOut, RouterType routerType, uint24 v3Fee, uint priceImpact) = 
-            _getBestRouter(amountForSwap, path);
-        require(bestRouter != address(0), "MonBridgeDex: No valid router found for this swap path");
 
         uint amountOutMin = _calculateAdaptiveSlippage(bestAmountOut, priceImpact, userSlippageBPS);
 
@@ -793,13 +819,103 @@ contract MonBridgeDex {
             swapType: swapType,
             routerType: routerType,
             router: bestRouter,
-            path: path,
+            path: optimalPath, // Use optimal path (may be multi-hop)
             v3Fees: v3Fees,
             amountIn: amountIn,
             amountOutMin: amountOutMin,
             deadline: block.timestamp + 300,
             supportFeeOnTransfer: supportFeeOnTransfer
         });
+    }
+
+    /// @notice Find best router with optimal path including V2 WETH routing
+    function _getBestRouterWithPath(uint amountIn, address[] memory path) internal view returns (
+        address bestRouter,
+        uint bestAmountOut,
+        RouterType bestRouterType,
+        uint24 bestV3Fee,
+        uint bestPriceImpact,
+        address[] memory bestPath
+    ) {
+        bestAmountOut = 0;
+        bestRouter = address(0);
+        bestRouterType = RouterType.V2;
+        bestV3Fee = 0;
+        bestPriceImpact = type(uint).max;
+        bestPath = path;
+
+        // Check all V2 routers with direct and multi-hop paths
+        for (uint i = 0; i < routersV2.length; i++) {
+            if (!_validateRouter(routersV2[i])) continue;
+            
+            // Try direct path
+            uint[] memory amounts;
+            try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
+                amounts = res;
+            } catch {
+                continue;
+            }
+            uint amountOut = amounts[amounts.length - 1];
+            
+            if (amountOut > bestAmountOut) {
+                bestAmountOut = amountOut;
+                bestRouter = routersV2[i];
+                bestRouterType = RouterType.V2;
+                bestPriceImpact = 0;
+                bestPath = path;
+            }
+
+            // For token-to-token swaps (not involving WETH), try routing through WETH
+            if (path.length == 2 && path[0] != WETH && path[1] != WETH) {
+                address[] memory wethPath = new address[](3);
+                wethPath[0] = path[0];
+                wethPath[1] = WETH;
+                wethPath[2] = path[1];
+                
+                uint[] memory wethAmounts;
+                try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
+                    wethAmounts = res;
+                } catch {
+                    continue;
+                }
+                uint wethAmountOut = wethAmounts[wethAmounts.length - 1];
+                
+                // If routing through WETH gives better price, use it
+                if (wethAmountOut > bestAmountOut) {
+                    bestAmountOut = wethAmountOut;
+                    bestRouter = routersV2[i];
+                    bestRouterType = RouterType.V2;
+                    bestPriceImpact = 0;
+                    bestPath = wethPath; // Return the WETH path
+                }
+            }
+        }
+
+        // Check all V3 routers (single hop only for now)
+        if (path.length == 2) {
+            for (uint i = 0; i < routersV3.length; i++) {
+                if (!_validateRouter(routersV3[i])) continue;
+                
+                address factory = v3RouterToFactory[routersV3[i]];
+                if (factory == address(0)) continue;
+
+                (address bestPool, uint24 bestFee, uint amountOut, uint impact) = _getBestV3Pool(
+                    factory,
+                    path[0],
+                    path[1],
+                    amountIn
+                );
+
+                if (bestPool != address(0) && amountOut > bestAmountOut) {
+                    bestAmountOut = amountOut;
+                    bestRouter = routersV3[i];
+                    bestRouterType = RouterType.V3;
+                    bestV3Fee = bestFee;
+                    bestPriceImpact = impact;
+                    bestPath = path; // V3 uses original path
+                }
+            }
+        }
     }
 
     /// @notice Execute swap with provided swap data
