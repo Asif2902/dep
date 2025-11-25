@@ -493,6 +493,26 @@ contract MonBridgeDex {
         return routersV3;
     }
 
+    /// @notice Get V2 routers count
+    function getRoutersV2Count() external view returns (uint) {
+        return routersV2.length;
+    }
+
+    /// @notice Get V3 routers count
+    function getRoutersV3Count() external view returns (uint) {
+        return routersV3.length;
+    }
+
+    /// @notice Get V3 fee tiers
+    function getV3FeeTiers() external view returns (uint24[] memory) {
+        return v3FeeTiers;
+    }
+
+    /// @notice Get fee percentage in basis points
+    function feePercent() external pure returns (uint) {
+        return 10000 / FEE_DIVISOR; // Returns 10 (0.1% = 10 bps)
+    }
+
     /// @notice Safe token approval with reset logic for non-standard tokens
     function _safeApprove(address token, address spender, uint256 amount) internal {
         // Check current allowance
@@ -712,8 +732,13 @@ contract MonBridgeDex {
 
         for (uint i = 0; i < v3FeeTiers.length; i++) {
             uint24 fee = v3FeeTiers[i];
-            address pool;
 
+            // Validate pool exists and has liquidity before attempting calculation
+            if (!_v3PoolExists(factory, tokenIn, tokenOut, fee)) {
+                continue;
+            }
+
+            address pool;
             try IUniswapV3Factory(factory).getPool(tokenIn, tokenOut, fee) returns (address p) {
                 pool = p;
             } catch {
@@ -752,6 +777,60 @@ contract MonBridgeDex {
         return true;
     }
 
+    /// @notice Check if V2 pair exists for given tokens
+    /// @dev Uniswap V2 stores pairs with sorted token addresses (token0 < token1)
+    function _v2PairExists(address router, address tokenA, address tokenB) internal view returns (bool) {
+        try IUniswapV2Router02(router).factory() returns (address factory) {
+            if (factory == address(0)) return false;
+            
+            // Sort tokens to match Uniswap V2 factory storage
+            (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+            
+            try IUniswapV2Factory(factory).getPair(token0, token1) returns (address pair) {
+                return pair != address(0);
+            } catch {
+                return false;
+            }
+        } catch {
+            return false;
+        }
+    }
+
+    /// @notice Validate V2 path exists (all pairs must exist)
+    function _validateV2Path(address router, address[] memory path) internal view returns (bool) {
+        if (path.length < 2) return false;
+        
+        for (uint i = 0; i < path.length - 1; i++) {
+            if (!_v2PairExists(router, path[i], path[i + 1])) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+
+    /// @notice Check if V3 pool exists and has liquidity
+    /// @dev Only checks pool existence and liquidity, avoiding strict checks that could exclude valid pools
+    function _v3PoolExists(address factory, address tokenA, address tokenB, uint24 fee) internal view returns (bool) {
+        if (factory == address(0)) return false;
+
+        address pool;
+        try IUniswapV3Factory(factory).getPool(tokenA, tokenB, fee) returns (address p) {
+            pool = p;
+        } catch {
+            return false;
+        }
+
+        if (pool == address(0)) return false;
+
+        // Check if pool has liquidity - this is the only critical validation
+        try IUniswapV3Pool(pool).liquidity() returns (uint128 liquidity) {
+            return liquidity > 0;
+        } catch {
+            return false;
+        }
+    }
+
     /// @notice Find best router (V2 or V3) with highest output
     function _getBestRouter(uint amountIn, address[] memory path) internal view returns (
         address bestRouter,
@@ -772,20 +851,23 @@ contract MonBridgeDex {
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
 
-            // Try direct path first
-            uint[] memory amounts;
-            try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
-                amounts = res;
-            } catch {
-                continue;
-            }
-            uint amountOut = amounts[amounts.length - 1];
+            // Try direct path first - validate pair exists
+            if (_validateV2Path(routersV2[i], path)) {
+                uint[] memory amounts;
+                try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
+                    amounts = res;
+                    uint amountOut = amounts[amounts.length - 1];
 
-            if (amountOut > bestAmountOut) {
-                bestAmountOut = amountOut;
-                bestRouter = routersV2[i];
-                bestRouterType = RouterType.V2;
-                bestPriceImpact = 0; // TODO: Calculate V2 price impact for multi-hop
+                    if (amountOut > 0 && amountOut > bestAmountOut) {
+                        bestAmountOut = amountOut;
+                        bestRouter = routersV2[i];
+                        bestRouterType = RouterType.V2;
+                        bestPriceImpact = 0;
+                        bestPath = path;
+                    }
+                } catch {
+                    // Skip this router if getAmountsOut fails
+                }
             }
 
             // For token-to-token swaps (not involving WETH), try routing through WETH
@@ -795,21 +877,24 @@ contract MonBridgeDex {
                 wethPath[1] = WETH;
                 wethPath[2] = path[1];
 
-                uint[] memory wethAmounts;
-                try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
-                    wethAmounts = res;
-                } catch {
-                    continue;
-                }
-                uint wethAmountOut = wethAmounts[wethAmounts.length - 1];
+                // Validate WETH path exists
+                if (_validateV2Path(routersV2[i], wethPath)) {
+                    uint[] memory wethAmounts;
+                    try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
+                        wethAmounts = res;
+                        uint wethAmountOut = wethAmounts[wethAmounts.length - 1];
 
-                // If routing through WETH gives better price, use it
-                if (wethAmountOut > bestAmountOut) {
-                    bestAmountOut = wethAmountOut;
-                    bestRouter = routersV2[i];
-                    bestRouterType = RouterType.V2;
-                    bestPriceImpact = 0;
-                    bestPath = wethPath;
+                        // If routing through WETH gives better price, use it
+                        if (wethAmountOut > 0 && wethAmountOut > bestAmountOut) {
+                            bestAmountOut = wethAmountOut;
+                            bestRouter = routersV2[i];
+                            bestRouterType = RouterType.V2;
+                            bestPriceImpact = 0;
+                            bestPath = wethPath;
+                        }
+                    } catch {
+                        // Skip this path if getAmountsOut fails
+                    }
                 }
             }
         }
@@ -1207,7 +1292,7 @@ contract MonBridgeDex {
 
     /// @notice Get quotes from all available routers
     function _getAllRouterQuotes(uint amountIn, address[] memory path) internal view returns (RouterQuote[] memory) {
-        uint maxQuotes = routersV2.length + routersV3.length * 2; // V3 may have multiple fee tiers
+        uint maxQuotes = routersV2.length * 2 + routersV3.length * 4; // Account for WETH routing and multiple fee tiers
         RouterQuote[] memory tempQuotes = new RouterQuote[](maxQuotes);
         uint quoteCount = 0;
 
@@ -1215,23 +1300,26 @@ contract MonBridgeDex {
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
 
-            uint[] memory amounts;
-            try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
-                amounts = res;
-            } catch {
-                continue;
-            }
-
-            if (amounts.length > 0 && amounts[amounts.length - 1] > 0) {
-                tempQuotes[quoteCount] = RouterQuote({
-                    router: routersV2[i],
-                    routerType: RouterType.V2,
-                    v3Fee: 0,
-                    amountOut: amounts[amounts.length - 1],
-                    priceImpact: 0,
-                    path: path
-                });
-                quoteCount++;
+            // Try direct path - validate pair exists
+            if (_validateV2Path(routersV2[i], path)) {
+                uint[] memory amounts;
+                try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
+                    amounts = res;
+                    
+                    if (amounts.length > 0 && amounts[amounts.length - 1] > 0) {
+                        tempQuotes[quoteCount] = RouterQuote({
+                            router: routersV2[i],
+                            routerType: RouterType.V2,
+                            v3Fee: 0,
+                            amountOut: amounts[amounts.length - 1],
+                            priceImpact: 0,
+                            path: path
+                        });
+                        quoteCount++;
+                    }
+                } catch {
+                    // Skip if quote fails
+                }
             }
 
             // Try WETH routing for token-to-token
@@ -1241,23 +1329,26 @@ contract MonBridgeDex {
                 wethPath[1] = WETH;
                 wethPath[2] = path[1];
 
-                uint[] memory wethAmounts;
-                try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
-                    wethAmounts = res;
-                } catch {
-                    continue;
-                }
+                // Validate WETH path exists
+                if (_validateV2Path(routersV2[i], wethPath)) {
+                    uint[] memory wethAmounts;
+                    try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
+                        wethAmounts = res;
 
-                if (wethAmounts.length > 0 && wethAmounts[wethAmounts.length - 1] > 0) {
-                    tempQuotes[quoteCount] = RouterQuote({
-                        router: routersV2[i],
-                        routerType: RouterType.V2,
-                        v3Fee: 0,
-                        amountOut: wethAmounts[wethAmounts.length - 1],
-                        priceImpact: 0,
-                        path: wethPath
-                    });
-                    quoteCount++;
+                        if (wethAmounts.length > 0 && wethAmounts[wethAmounts.length - 1] > 0) {
+                            tempQuotes[quoteCount] = RouterQuote({
+                                router: routersV2[i],
+                                routerType: RouterType.V2,
+                                v3Fee: 0,
+                                amountOut: wethAmounts[wethAmounts.length - 1],
+                                priceImpact: 0,
+                                path: wethPath
+                            });
+                            quoteCount++;
+                        }
+                    } catch {
+                        // Skip if quote fails
+                    }
                 }
             }
         }
@@ -1272,8 +1363,13 @@ contract MonBridgeDex {
 
                 for (uint j = 0; j < v3FeeTiers.length; j++) {
                     uint24 fee = v3FeeTiers[j];
-                    address pool;
 
+                    // Validate pool exists and has liquidity before quoting
+                    if (!_v3PoolExists(factory, path[0], path[1], fee)) {
+                        continue;
+                    }
+
+                    address pool;
                     try IUniswapV3Factory(factory).getPool(path[0], path[1], fee) returns (address p) {
                         pool = p;
                     } catch {
@@ -1329,21 +1425,23 @@ contract MonBridgeDex {
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
 
-            // Try direct path
-            uint[] memory amounts;
-            try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
-                amounts = res;
-            } catch {
-                continue;
-            }
-            uint amountOut = amounts[amounts.length - 1];
+            // Try direct path - validate pair exists
+            if (_validateV2Path(routersV2[i], path)) {
+                uint[] memory amounts;
+                try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
+                    amounts = res;
+                    uint amountOut = amounts[amounts.length - 1];
 
-            if (amountOut > bestAmountOut) {
-                bestAmountOut = amountOut;
-                bestRouter = routersV2[i];
-                bestRouterType = RouterType.V2;
-                bestPriceImpact = 0;
-                bestPath = path;
+                    if (amountOut > 0 && amountOut > bestAmountOut) {
+                        bestAmountOut = amountOut;
+                        bestRouter = routersV2[i];
+                        bestRouterType = RouterType.V2;
+                        bestPriceImpact = 0;
+                        bestPath = path;
+                    }
+                } catch {
+                    // Skip this router if getAmountsOut fails
+                }
             }
 
             // For token-to-token swaps (not involving WETH), try routing through WETH
@@ -1353,21 +1451,24 @@ contract MonBridgeDex {
                 wethPath[1] = WETH;
                 wethPath[2] = path[1];
 
-                uint[] memory wethAmounts;
-                try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
-                    wethAmounts = res;
-                } catch {
-                    continue;
-                }
-                uint wethAmountOut = wethAmounts[wethAmounts.length - 1];
+                // Validate WETH path exists
+                if (_validateV2Path(routersV2[i], wethPath)) {
+                    uint[] memory wethAmounts;
+                    try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
+                        wethAmounts = res;
+                        uint wethAmountOut = wethAmounts[wethAmounts.length - 1];
 
-                // If routing through WETH gives better price, use it
-                if (wethAmountOut > bestAmountOut) {
-                    bestAmountOut = wethAmountOut;
-                    bestRouter = routersV2[i];
-                    bestRouterType = RouterType.V2;
-                    bestPriceImpact = 0;
-                    bestPath = wethPath;
+                        // If routing through WETH gives better price, use it
+                        if (wethAmountOut > 0 && wethAmountOut > bestAmountOut) {
+                            bestAmountOut = wethAmountOut;
+                            bestRouter = routersV2[i];
+                            bestRouterType = RouterType.V2;
+                            bestPriceImpact = 0;
+                            bestPath = wethPath;
+                        }
+                    } catch {
+                        // Skip this path if getAmountsOut fails
+                    }
                 }
             }
         }
