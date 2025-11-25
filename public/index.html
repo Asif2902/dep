@@ -1526,14 +1526,59 @@
 
                 // Check 4: Call contract's getBestSwapData
                 diagnostics.checks.push({ name: 'Contract Quote', status: 'checking' });
-                const swapData = await contract.getBestSwapData(
-                    amountIn,
-                    path,
-                    false,
-                    slippageBPS
-                );
-                diagnostics.checks[3].status = 'passed';
-                diagnostics.success = true;
+                diagnostics.checks[3].contractParams = {
+                    amountIn: amountIn.toString(),
+                    path: path,
+                    supportFeeOnTransfer: false,
+                    slippageBPS: slippageBPS
+                };
+                
+                let swapData;
+                try {
+                    swapData = await contract.getBestSwapData(
+                        amountIn,
+                        path,
+                        false,
+                        slippageBPS
+                    );
+                    diagnostics.checks[3].status = 'passed';
+                    diagnostics.success = true;
+                } catch (contractError) {
+                    // Detailed error capturing
+                    diagnostics.checks[3].status = 'failed';
+                    
+                    // Parse error message
+                    let errorMsg = contractError.message || 'Unknown error';
+                    let revertReason = 'Contract execution failed';
+                    
+                    // Try to extract revert reason from error
+                    if (contractError.data) {
+                        try {
+                            const iface = new ethers.utils.Interface(['function Error(string)']);
+                            const decodedError = iface.parseError(contractError.data);
+                            if (decodedError) revertReason = decodedError.args[0];
+                        } catch (e) {}
+                    }
+                    
+                    // Try ethers error decoding
+                    if (errorMsg.includes('revert')) {
+                        const revertMatch = errorMsg.match(/revert (.*?)($|,)/);
+                        if (revertMatch) revertReason = revertMatch[1];
+                    }
+                    
+                    diagnostics.checks[3].error = {
+                        message: errorMsg,
+                        reason: revertReason,
+                        code: contractError.code,
+                        data: contractError.data ? contractError.data.slice(0, 100) : null
+                    };
+                    
+                    // Detailed diagnostic message
+                    const detailedError = `Contract Error: ${revertReason}\n\nDetails:\n- Error Code: ${contractError.code || 'Unknown'}\n- Message: ${errorMsg.slice(0, 150)}`;
+                    diagnostics.failureReason = detailedError;
+                    
+                    throw new Error(detailedError);
+                }
 
                 currentQuote = swapData;
 
@@ -1614,7 +1659,33 @@
                 let diagHtml = '<div style="background: #ffebee; padding: 15px; border-radius: 8px; margin: 15px 0;">';
                 diagHtml += '<h4 style="margin: 0 0 10px 0; color: #c62828;">✗ Quote Failed - Diagnostics</h4>';
 
-                if (diagnostics.failureReason) {
+                // Show contract error details if available
+                const contractCheck = diagnostics.checks && diagnostics.checks[3];
+                if (contractCheck && contractCheck.error) {
+                    diagHtml += '<div style="background: #ffcccc; padding: 12px; border-radius: 5px; margin-bottom: 15px; border-left: 4px solid #d32f2f;">';
+                    diagHtml += `<p style="margin: 5px 0; font-weight: bold; color: #c62828;">🔴 Contract Quote Failed</p>`;
+                    diagHtml += `<p style="margin: 5px 0; font-family: monospace; font-size: 0.85em; color: #333;"><strong>Reason:</strong> ${contractCheck.error.reason}</p>`;
+                    diagHtml += `<p style="margin: 5px 0; font-family: monospace; font-size: 0.85em; color: #333;"><strong>Error Code:</strong> ${contractCheck.error.code || 'Unknown'}</p>`;
+                    if (contractCheck.error.message) {
+                        diagHtml += `<p style="margin: 5px 0; font-family: monospace; font-size: 0.85em; color: #555;"><strong>Details:</strong> ${contractCheck.error.message.slice(0, 200)}</p>`;
+                    }
+                    diagHtml += '</div>';
+                    
+                    // Show parameters that were sent
+                    if (contractCheck.contractParams) {
+                        diagHtml += '<div style="background: #fff9c4; padding: 12px; border-radius: 5px; margin-bottom: 15px;">';
+                        diagHtml += '<p style="margin: 5px 0; font-weight: bold; color: #333;">Contract Parameters Sent:</p>';
+                        diagHtml += '<ul style="margin: 5px 0; padding-left: 20px; font-size: 0.9em; font-family: monospace;">';
+                        diagHtml += `<li><strong>Amount In:</strong> ${contractCheck.contractParams.amountIn}</li>`;
+                        diagHtml += `<li><strong>Path:</strong> [${contractCheck.contractParams.path.map(p => p.slice(0, 8) + '...').join(', ')}]</li>`;
+                        diagHtml += `<li><strong>Slippage (BPS):</strong> ${contractCheck.contractParams.slippageBPS} (${(contractCheck.contractParams.slippageBPS / 100).toFixed(2)}%)</li>`;
+                        diagHtml += `<li><strong>Support Fee-on-Transfer:</strong> ${contractCheck.contractParams.supportFeeOnTransfer}</li>`;
+                        diagHtml += '</ul>';
+                        diagHtml += '</div>';
+                    }
+                }
+
+                if (diagnostics.failureReason && !contractCheck?.error) {
                     diagHtml += `<p style="margin: 10px 0; font-weight: bold; color: #c62828;">${diagnostics.failureReason}</p>`;
                 }
 
