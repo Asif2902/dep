@@ -590,7 +590,11 @@
         let signer;
         let contract;
         let userAddress;
-        let contractConfig;
+        let contractConfig = {
+            contractAddress: "0xCE9Bc1F4d66DA6609023A0f1AA8dbC09CdDE57b7",
+            chainId: 143,
+            network: "monad"
+        };
         let currentQuote = null;
 
         const ERC20_ABI = [
@@ -622,8 +626,6 @@
 
         async function init() {
             try {
-                const response = await fetch('deployment.json');
-                contractConfig = await response.json();
                 document.getElementById('contractAddress').textContent = 
                     `Contract: ${contractConfig.contractAddress.slice(0, 6)}...${contractConfig.contractAddress.slice(-4)}`;
 
@@ -644,7 +646,7 @@
                 }
             } catch (error) {
                 console.error('Init error:', error);
-                showMessage('swapMessage', 'Error loading contract configuration', 'error');
+                showMessage('swapMessage', 'Error initializing contract', 'error');
             }
         }
 
