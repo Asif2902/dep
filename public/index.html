@@ -1295,6 +1295,40 @@
             }
         }
 
+        async function debugQuote() {
+            const tokenIn = document.getElementById('tokenIn').value;
+            const tokenOut = document.getElementById('tokenOut').value;
+            const amountIn = document.getElementById('amountIn').value;
+
+            if (!ethers.utils.isAddress(tokenIn) || !ethers.utils.isAddress(tokenOut)) {
+                showMessage('swapMessage', 'Invalid token addresses', 'error');
+                return;
+            }
+
+            try {
+                showMessage('swapMessage', 'Calling contract debug function...', 'info');
+                const result = await contract.debugGetQuote(
+                    ethers.utils.parseUnits(amountIn || '1', 18),
+                    [tokenIn, tokenOut]
+                );
+                
+                let debugHtml = '<div style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #1976d2;">';
+                debugHtml += '<h4 style="margin: 0 0 10px 0; color: #1565c0;">🔍 Contract Debug Info</h4>';
+                debugHtml += '<ul style="margin: 5px 0; padding-left: 20px; font-family: monospace;">';
+                debugHtml += `<li><strong>V2 Best Output:</strong> ${result.v2BestOut.toString()}</li>`;
+                debugHtml += `<li><strong>V3 Best Output:</strong> ${result.v3BestOut.toString()}</li>`;
+                debugHtml += `<li><strong>Final Best Output:</strong> ${result.finalBestOut.toString()}</li>`;
+                debugHtml += `<li><strong>Best Router:</strong> ${result.finalBestRouter}</li>`;
+                debugHtml += `<li><strong>Decision:</strong> ${result.debugInfo}</li>`;
+                debugHtml += '</ul></div>';
+                
+                document.getElementById('quoteResult').innerHTML = debugHtml;
+                showMessage('swapMessage', 'Debug info retrieved!', 'success');
+            } catch (error) {
+                showMessage('swapMessage', `Debug Error: ${error.message}`, 'error');
+            }
+        }
+
         async function getQuote() {
             const tokenIn = document.getElementById('tokenIn').value;
             const tokenOut = document.getElementById('tokenOut').value;

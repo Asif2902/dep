@@ -2136,4 +2136,67 @@ contract MonBridgeDex {
     }
 
     receive() external payable {}
+
+    /// @notice DEBUG: Get detailed quote calculation info (shows why quote might fail)
+    /// @dev Returns exact outputs the contract calculates internally
+    function debugGetQuote(
+        uint amountIn,
+        address[] calldata path
+    ) external view returns (
+        uint v2BestOut,
+        uint v3BestOut,
+        uint finalBestOut,
+        address finalBestRouter,
+        string memory debugInfo
+    ) {
+        require(path.length >= 2, "Invalid path");
+        require(amountIn > 0, "Amount must be > 0");
+
+        uint fee = amountIn / FEE_DIVISOR;
+        uint amountForSwap = amountIn - fee;
+
+        // Track V2
+        uint v2Best = 0;
+        for (uint i = 0; i < routersV2.length; i++) {
+            if (!_validateRouter(routersV2[i])) continue;
+            if (!_validateV2Path(routersV2[i], path)) continue;
+
+            try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountForSwap, path) returns (uint[] memory amounts) {
+                uint out = amounts[amounts.length - 1];
+                if (out > v2Best) v2Best = out;
+            } catch {}
+        }
+        v2BestOut = v2Best;
+
+        // Track V3
+        uint v3Best = 0;
+        address v3Router = address(0);
+        for (uint i = 0; i < routersV3.length; i++) {
+            if (!_validateRouter(routersV3[i])) continue;
+            address factory = v3RouterToFactory[routersV3[i]];
+            if (factory == address(0)) continue;
+
+            if (path.length == 2) {
+                (address bestPool, uint24 bestFee, uint amountOut, ) = _getBestV3Pool(factory, path[0], path[1], amountForSwap);
+                if (bestPool != address(0) && amountOut > v3Best) {
+                    v3Best = amountOut;
+                    v3Router = routersV3[i];
+                }
+            }
+        }
+        v3BestOut = v3Best;
+
+        // Determine final best
+        if (v2Best > v3Best && v2Best > 0) {
+            finalBestOut = v2Best;
+            finalBestRouter = routersV2[0];
+            debugInfo = "V2 is best";
+        } else if (v3Best > 0) {
+            finalBestOut = v3Best;
+            finalBestRouter = v3Router;
+            debugInfo = "V3 is best";
+        } else {
+            debugInfo = "NO ROUTES FOUND";
+        }
+    }
 }
