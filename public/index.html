@@ -1401,30 +1401,95 @@
                             provider
                         );
 
-                        const feeTiers = [500, 3000, 10000];
-                        let foundPool = false;
+                        const feeTiers = [
+                            { fee: 100, label: '0.01%' },
+                            { fee: 500, label: '0.05%' },
+                            { fee: 3000, label: '0.3%' },
+                            { fee: 10000, label: '1%' }
+                        ];
+                        
+                        const v3ResultDetail = {
+                            router,
+                            type: 'V3',
+                            factory,
+                            feeTiersChecked: []
+                        };
+                        
+                        let bestPool = null;
+                        let bestFee = null;
+                        let bestLiquidity = null;
 
-                        for (const fee of feeTiers) {
-                            const pool = await factoryContract.getPool(tokenIn, tokenOut, fee);
-                            if (pool && pool !== '0x0000000000000000000000000000000000000000') {
-                                foundPool = true;
-                                diagnostics.routerResults.push({
-                                    router,
-                                    type: 'V3',
-                                    status: 'success',
-                                    pool,
-                                    fee
-                                });
-                                break;
+                        for (const {fee, label} of feeTiers) {
+                            const tierResult = { fee, label, poolExists: false, details: '' };
+                            
+                            try {
+                                const pool = await factoryContract.getPool(tokenIn, tokenOut, fee);
+                                if (pool && pool !== '0x0000000000000000000000000000000000000000') {
+                                    tierResult.poolAddress = pool;
+                                    tierResult.poolExists = true;
+                                    
+                                    // Try to get pool details
+                                    try {
+                                        const poolContract = new ethers.Contract(
+                                            pool,
+                                            ['function liquidity() external view returns (uint128)',
+                                             'function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+                                             'function token0() external view returns (address)',
+                                             'function token1() external view returns (address)'],
+                                            provider
+                                        );
+                                        
+                                        const liquidity = await poolContract.liquidity();
+                                        const slot0 = await poolContract.slot0();
+                                        const token0 = await poolContract.token0();
+                                        const token1 = await poolContract.token1();
+                                        
+                                        tierResult.liquidity = liquidity.toString();
+                                        tierResult.sqrtPrice = slot0.sqrtPriceX96.toString();
+                                        tierResult.tick = slot0.tick.toString();
+                                        tierResult.unlocked = slot0.unlocked;
+                                        tierResult.tokenOrder = `${token0 === tokenIn ? 'Correct' : 'Reversed'}`;
+                                        
+                                        if (liquidity.gt(0)) {
+                                            tierResult.details = `✓ Active pool with ${liquidity.toString().slice(0, 8)}... liquidity`;
+                                            if (!bestPool || liquidity.gt(bestLiquidity)) {
+                                                bestPool = pool;
+                                                bestFee = fee;
+                                                bestLiquidity = liquidity;
+                                            }
+                                        } else {
+                                            tierResult.details = '⚠ Pool exists but has NO liquidity';
+                                        }
+                                    } catch (poolErr) {
+                                        tierResult.details = `✓ Pool found at ${pool.slice(0,10)}... (details error: ${poolErr.message.slice(0, 30)})`;
+                                    }
+                                } else {
+                                    tierResult.details = '✗ No pool at this fee tier';
+                                }
+                            } catch (feeErr) {
+                                tierResult.details = `✗ Error checking fee tier: ${feeErr.message.slice(0, 50)}`;
                             }
+                            
+                            v3ResultDetail.feeTiersChecked.push(tierResult);
                         }
 
-                        if (!foundPool) {
+                        if (bestPool) {
                             diagnostics.routerResults.push({
                                 router,
                                 type: 'V3',
+                                status: 'success',
+                                pool: bestPool,
+                                fee: bestFee,
+                                liquidity: bestLiquidity.toString(),
+                                allTiers: v3ResultDetail.feeTiersChecked
+                            });
+                        } else {
+                            // No liquidity found in any tier
+                            diagnostics.routerResults.push({
+                                ...v3ResultDetail,
                                 status: 'failed',
-                                error: 'No pools found for this pair in any fee tier'
+                                error: 'No pools with liquidity found in any fee tier',
+                                allTiers: v3ResultDetail.feeTiersChecked
                             });
                         }
                     } catch (e) {
@@ -1432,7 +1497,7 @@
                             router,
                             type: 'V3',
                             status: 'failed',
-                            error: e.message
+                            error: `Factory error: ${e.message}`
                         });
                     }
                 }
@@ -1479,6 +1544,21 @@
                 diagHtml += '<h4 style="margin: 0 0 10px 0; color: #2e7d32;">✓ Diagnostics Passed</h4>';
                 diagHtml += `<p style="margin: 5px 0;"><strong>Routers tested:</strong> ${diagnostics.routerResults.length}</p>`;
                 diagHtml += `<p style="margin: 5px 0;"><strong>Successful routes:</strong> ${successfulRouters.length}</p>`;
+                
+                // Show detailed info about selected router
+                const selectedRoute = diagnostics.routerResults.find(r => r.router === swapData.router);
+                if (selectedRoute) {
+                    if (selectedRoute.type === 'V3' && selectedRoute.liquidity) {
+                        diagHtml += `<p style="margin: 5px 0;"><strong>V3 Pool Liquidity:</strong> ${selectedRoute.liquidity.slice(0, 15)}...</p>`;
+                        if (selectedRoute.allTiers) {
+                            const activeTier = selectedRoute.allTiers.find(t => t.poolExists && t.liquidity && t.liquidity !== '0');
+                            if (activeTier) {
+                                diagHtml += `<p style="margin: 5px 0;"><strong>Fee Tier Used:</strong> ${activeTier.label}</p>`;
+                            }
+                        }
+                    }
+                }
+                
                 diagHtml += '</div>';
 
                 document.getElementById('quoteResult').innerHTML = diagHtml + `
@@ -1554,9 +1634,44 @@
                     diagnostics.routerResults.forEach(result => {
                         const icon = result.status === 'success' ? '✓' : '✗';
                         diagHtml += `<li>${icon} ${result.type} Router ${result.router.slice(0, 10)}...`;
-                        if (result.error) diagHtml += ` - <span style="color: #c62828;">${result.error}</span>`;
-                        if (result.output) diagHtml += ` - Output: ${result.output}`;
-                        if (result.pool) diagHtml += ` - Pool: ${result.pool.slice(0, 10)}... (Fee: ${result.fee / 10000}%)`;
+                        
+                        if (result.error) {
+                            diagHtml += ` - <span style="color: #c62828;"><strong>${result.error}</strong></span>`;
+                        }
+                        
+                        if (result.output) {
+                            diagHtml += ` - Output: ${result.output}`;
+                        }
+                        
+                        if (result.pool) {
+                            diagHtml += ` - Pool: ${result.pool.slice(0, 10)}... (Fee: ${result.fee / 10000}%)`;
+                            if (result.liquidity) diagHtml += ` - Liquidity: ${result.liquidity.slice(0, 10)}...`;
+                        }
+                        
+                        // Show V3 fee tier details if present
+                        if (result.allTiers && result.allTiers.length > 0) {
+                            diagHtml += '<ul style="margin: 5px 5px; padding-left: 20px; border-left: 2px solid #667eea;">';
+                            result.allTiers.forEach(tier => {
+                                const tierIcon = tier.poolExists ? '✓' : '✗';
+                                diagHtml += `<li style="font-size: 0.9em;"><strong>${tierIcon} Fee ${tier.label}</strong>: `;
+                                
+                                if (tier.poolExists && tier.liquidity) {
+                                    const liqStr = tier.liquidity.slice(0, 15);
+                                    diagHtml += `Pool: ${tier.poolAddress.slice(0, 8)}... | Liquidity: ${liqStr}... | `;
+                                    diagHtml += `Price (sqrtX96): ${tier.sqrtPrice.slice(0, 10)}... | `;
+                                    diagHtml += `Tick: ${tier.tick} | `;
+                                    diagHtml += `Token Order: ${tier.tokenOrder}`;
+                                }
+                                
+                                if (tier.details) {
+                                    diagHtml += tier.details;
+                                }
+                                
+                                diagHtml += '</li>';
+                            });
+                            diagHtml += '</ul>';
+                        }
+                        
                         diagHtml += '</li>';
                     });
                     diagHtml += '</ul></div>';

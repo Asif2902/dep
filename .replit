@@ -1,6 +1,6 @@
 run = "cowsay Configure me!"
 entrypoint = "README.md"
-modules = ["web", "nodejs-20"]
+modules = ["web", "nodejs-20", "python-3.11"]
 
 [nix]
 channel = "stable-25_05"
@@ -21,6 +21,10 @@ author = "agent"
 task = "workflow.run"
 args = "Compile Contract"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Serve Frontend"
+
 [[workflows.workflow]]
 name = "Compile Contract"
 author = "agent"
@@ -31,3 +35,23 @@ args = "npx hardhat compile"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow]]
+name = "Serve Frontend"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python3 -m http.server 5000 --bind 0.0.0.0 -d ./public"
+waitForPort = 5000
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[[ports]]
+localPort = 37647
+externalPort = 3000
