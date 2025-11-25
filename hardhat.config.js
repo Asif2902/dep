@@ -2,7 +2,7 @@ require("@nomicfoundation/hardhat-toolbox");
 
 // Load environment variables
 const PRIVATE_KEY = process.env.DEPLOYER_PRIVATE_KEY || "";
-const MONAD_RPC_URL = process.env.MONAD_RPC_URL || "https://rpc.monad.xyz";
+const MONAD_RPC_URL = "https://rpc.monad.xyz";
 
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
