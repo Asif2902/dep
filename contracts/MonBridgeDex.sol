@@ -1602,6 +1602,7 @@ contract MonBridgeDex {
     }
 
     /// @notice Execute split swap across multiple routers
+    /// @dev All splits must have the same input token and swap type
     function executeSplit(SplitSwapData calldata splitData)
         external
         payable
@@ -1612,16 +1613,44 @@ contract MonBridgeDex {
         require(splitData.splits.length >= 2 && splitData.splits.length <= 4, "MonBridgeDex: Invalid split count (2-4)");
         require(splitData.totalAmountIn > 0, "MonBridgeDex: Amount must be greater than 0");
 
-        // Validate tokens in all paths
+        // Validate tokens in all paths and ensure all splits use the same input token
+        address inputToken = splitData.splits[0].path[0];
+        SwapType swapType = splitData.splits[0].swapType;
+        address outputToken = splitData.splits[0].path[splitData.splits[0].path.length - 1];
+        
         for (uint i = 0; i < splitData.splits.length; i++) {
+            require(splitData.splits[i].path[0] == inputToken, "MonBridgeDex: All splits must have same input token");
+            require(splitData.splits[i].swapType == swapType, "MonBridgeDex: All splits must have same swap type");
             for (uint j = 0; j < splitData.splits[i].path.length; j++) {
                 require(!tokenBlacklist[splitData.splits[i].path[j]], "MonBridgeDex: Token blacklisted");
             }
         }
 
+        // Validate that split amounts sum to total
+        uint splitSum = 0;
+        for (uint i = 0; i < splitData.splits.length; i++) {
+            splitSum += splitData.splits[i].amountIn;
+        }
+        require(splitSum == splitData.totalAmountIn, "MonBridgeDex: Split amounts must sum to total");
+
+        // Calculate fee at total level (not per-split to avoid rounding issues)
         uint totalFee = splitData.totalAmountIn / FEE_DIVISOR;
-        address outputToken = splitData.splits[0].path[splitData.splits[0].path.length - 1];
-        SwapType swapType = splitData.splits[0].swapType;
+        uint totalAmountForSwap = splitData.totalAmountIn - totalFee;
+
+        // CRITICAL: Pull ALL tokens from user upfront before any split execution
+        // because _executeSwapInternal is called via this.func() which changes msg.sender
+        if (swapType == SwapType.ETH_TO_TOKEN) {
+            require(inputToken == WETH, "MonBridgeDex: Path must start with WETH for ETH swap");
+            require(msg.value == splitData.totalAmountIn, "MonBridgeDex: Incorrect ETH amount sent");
+            feeAccumulatedETH += totalFee;
+        } else {
+            // TOKEN_TO_ETH or TOKEN_TO_TOKEN: pull all tokens from user at once
+            require(
+                IERC20(inputToken).transferFrom(msg.sender, address(this), splitData.totalAmountIn),
+                "MonBridgeDex: Token transfer from user failed"
+            );
+            feeAccumulatedTokens[inputToken] += totalFee;
+        }
 
         uint balanceBefore;
         if (swapType == SwapType.TOKEN_TO_ETH) {
@@ -1630,7 +1659,9 @@ contract MonBridgeDex {
             balanceBefore = IERC20(outputToken).balanceOf(msg.sender);
         }
 
-        // Execute each split
+        // Execute each split - tokens are already in the contract
+        // Distribute the post-fee amount proportionally to each split
+        uint usedAmount = 0;
         for (uint i = 0; i < splitData.splits.length; i++) {
             SwapData memory split = splitData.splits[i];
 
@@ -1641,10 +1672,17 @@ contract MonBridgeDex {
             );
             require(_validateRouter(split.router), "MonBridgeDex: Router unhealthy");
 
-            uint splitFee = split.amountIn / FEE_DIVISOR;
-            uint amountForSwap = split.amountIn - splitFee;
+            // Calculate proportional amount for this split (no per-split fee to avoid rounding issues)
+            // For the last split, use remaining amount to avoid rounding errors
+            uint amountForSwap;
+            if (i == splitData.splits.length - 1) {
+                amountForSwap = totalAmountForSwap - usedAmount;
+            } else {
+                amountForSwap = (split.amountIn * totalAmountForSwap) / splitData.totalAmountIn;
+                usedAmount += amountForSwap;
+            }
 
-            try this._executeSwapInternal(split, amountForSwap, splitFee) {
+            try this._executeSwapInternal(split, amountForSwap, msg.sender) {
                 _recordSwapSuccess(split.router, amountForSwap);
             } catch Error(string memory reason) {
                 _recordSwapFailure(split.router);
@@ -1667,7 +1705,7 @@ contract MonBridgeDex {
 
         emit SplitSwapExecuted(
             msg.sender,
-            splitData.splits[0].path[0],
+            inputToken,
             outputToken,
             splitData.totalAmountIn,
             totalAmountOut,
@@ -1727,6 +1765,21 @@ contract MonBridgeDex {
         uint fee = swapData.amountIn / FEE_DIVISOR;
         uint amountForSwap = swapData.amountIn - fee;
 
+        // CRITICAL: Pull tokens from user HERE before calling _executeSwapInternal
+        // because _executeSwapInternal is called via this.func() which changes msg.sender
+        if (swapData.swapType == SwapType.ETH_TO_TOKEN) {
+            require(swapData.path[0] == WETH, "MonBridgeDex: Path must start with WETH for ETH swap");
+            require(msg.value == swapData.amountIn, "MonBridgeDex: Incorrect ETH amount sent");
+            feeAccumulatedETH += fee;
+        } else {
+            // TOKEN_TO_ETH or TOKEN_TO_TOKEN: pull tokens from user
+            require(
+                IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn),
+                "MonBridgeDex: Token transfer from user failed"
+            );
+            feeAccumulatedTokens[swapData.path[0]] += fee;
+        }
+
         uint balanceBefore;
         address outputToken = swapData.path[swapData.path.length - 1];
 
@@ -1736,7 +1789,7 @@ contract MonBridgeDex {
             balanceBefore = IERC20(outputToken).balanceOf(msg.sender);
         }
 
-        try this._executeSwapInternal(swapData, amountForSwap, fee) returns (uint result) {
+        try this._executeSwapInternal(swapData, amountForSwap, msg.sender) returns (uint result) {
             amountOut = result;
             _recordSwapSuccess(swapData.router, amountForSwap);
         } catch Error(string memory reason) {
@@ -1771,39 +1824,39 @@ contract MonBridgeDex {
     }
 
     /// @notice Internal swap execution (called via try-catch)
-    function _executeSwapInternal(SwapData calldata swapData, uint amountForSwap, uint fee)
+    /// @param swapData The swap parameters
+    /// @param amountForSwap Amount after fee deduction
+    /// @param recipient The original caller who should receive the output tokens
+    function _executeSwapInternal(SwapData calldata swapData, uint amountForSwap, address recipient)
         external
         returns (uint amountOut)
     {
         require(msg.sender == address(this), "Internal only");
 
         if (swapData.routerType == RouterType.V2) {
-            return _executeV2Swap(swapData, amountForSwap, fee);
+            return _executeV2Swap(swapData, amountForSwap, recipient);
         } else {
-            return _executeV3Swap(swapData, amountForSwap, fee);
+            return _executeV3Swap(swapData, amountForSwap, recipient);
         }
     }
 
     /// @notice Execute V2 swap
-    function _executeV2Swap(SwapData calldata swapData, uint amountForSwap, uint fee) internal returns (uint amountOut) {
+    /// @dev Token transfers and fee accumulation are handled in execute() before this is called
+    function _executeV2Swap(SwapData calldata swapData, uint amountForSwap, address recipient) internal returns (uint amountOut) {
         if (swapData.swapType == SwapType.ETH_TO_TOKEN) {
-            require(swapData.path[0] == WETH, "Path must start with WETH");
-            require(msg.value == swapData.amountIn, "Incorrect ETH amount");
-
-            feeAccumulatedETH += fee;
-
+            // ETH was already validated and fee accumulated in execute()
             if (swapData.supportFeeOnTransfer) {
                 IUniswapV2Router02(swapData.router).swapExactETHForTokensSupportingFeeOnTransferTokens{value: amountForSwap}(
                     swapData.amountOutMin,
                     swapData.path,
-                    msg.sender,
+                    recipient,
                     swapData.deadline
                 );
             } else {
                 uint[] memory amounts = IUniswapV2Router02(swapData.router).swapExactETHForTokens{value: amountForSwap}(
                     swapData.amountOutMin,
                     swapData.path,
-                    msg.sender,
+                    recipient,
                     swapData.deadline
                 );
                 amountOut = amounts[amounts.length - 1];
@@ -1811,10 +1864,7 @@ contract MonBridgeDex {
 
         } else if (swapData.swapType == SwapType.TOKEN_TO_ETH) {
             require(swapData.path[swapData.path.length - 1] == WETH, "Path must end with WETH");
-
-            require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "MonBridgeDex: Token transfer from user failed");
-            feeAccumulatedTokens[swapData.path[0]] += fee;
-
+            // Tokens already transferred to contract and fee accumulated in execute()
             _safeApprove(swapData.path[0], swapData.router, amountForSwap);
 
             if (swapData.supportFeeOnTransfer) {
@@ -1822,7 +1872,7 @@ contract MonBridgeDex {
                     amountForSwap,
                     swapData.amountOutMin,
                     swapData.path,
-                    msg.sender,
+                    recipient,
                     swapData.deadline
                 );
             } else {
@@ -1830,16 +1880,14 @@ contract MonBridgeDex {
                     amountForSwap,
                     swapData.amountOutMin,
                     swapData.path,
-                    msg.sender,
+                    recipient,
                     swapData.deadline
                 );
                 amountOut = amounts[amounts.length - 1];
             }
 
         } else {
-            require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "MonBridgeDex: Token transfer from user failed");
-            feeAccumulatedTokens[swapData.path[0]] += fee;
-
+            // TOKEN_TO_TOKEN: Tokens already transferred to contract and fee accumulated in execute()
             _safeApprove(swapData.path[0], swapData.router, amountForSwap);
 
             if (swapData.supportFeeOnTransfer) {
@@ -1847,7 +1895,7 @@ contract MonBridgeDex {
                     amountForSwap,
                     swapData.amountOutMin,
                     swapData.path,
-                    msg.sender,
+                    recipient,
                     swapData.deadline
                 );
             } else {
@@ -1855,7 +1903,7 @@ contract MonBridgeDex {
                     amountForSwap,
                     swapData.amountOutMin,
                     swapData.path,
-                    msg.sender,
+                    recipient,
                     swapData.deadline
                 );
                 amountOut = amounts[amounts.length - 1];
@@ -1880,13 +1928,10 @@ contract MonBridgeDex {
     }
 
     /// @notice Execute V3 swap (supports multi-hop)
-    function _executeV3Swap(SwapData calldata swapData, uint amountForSwap, uint fee) internal returns (uint amountOut) {
+    /// @dev Token transfers and fee accumulation are handled in execute() before this is called
+    function _executeV3Swap(SwapData calldata swapData, uint amountForSwap, address recipient) internal returns (uint amountOut) {
         if (swapData.swapType == SwapType.ETH_TO_TOKEN) {
-            require(swapData.path[0] == WETH, "MonBridgeDex: Path must start with WETH");
-            require(msg.value == swapData.amountIn, "MonBridgeDex: Incorrect ETH amount");
-
-            feeAccumulatedETH += fee;
-
+            // ETH was already validated and fee accumulated in execute()
             // V3 requires WETH, so wrap ETH first
             IWETH(WETH).deposit{value: amountForSwap}();
             _safeApprove(WETH, swapData.router, amountForSwap);
@@ -1896,7 +1941,7 @@ contract MonBridgeDex {
                     tokenIn: swapData.path[0],
                     tokenOut: swapData.path[1],
                     fee: swapData.v3Fees[0],
-                    recipient: msg.sender,
+                    recipient: recipient,
                     deadline: swapData.deadline,
                     amountIn: amountForSwap,
                     amountOutMinimum: swapData.amountOutMin,
@@ -1909,7 +1954,7 @@ contract MonBridgeDex {
 
                 ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
                     path: path,
-                    recipient: msg.sender,
+                    recipient: recipient,
                     deadline: swapData.deadline,
                     amountIn: amountForSwap,
                     amountOutMinimum: swapData.amountOutMin
@@ -1920,10 +1965,7 @@ contract MonBridgeDex {
 
         } else if (swapData.swapType == SwapType.TOKEN_TO_ETH) {
             require(swapData.path[swapData.path.length - 1] == WETH, "MonBridgeDex: Path must end with WETH");
-
-            require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "MonBridgeDex: Token transfer from user failed");
-            feeAccumulatedTokens[swapData.path[0]] += fee;
-
+            // Tokens already transferred to contract and fee accumulated in execute()
             _safeApprove(swapData.path[0], swapData.router, amountForSwap);
 
             if (swapData.path.length == 2) {
@@ -1953,14 +1995,12 @@ contract MonBridgeDex {
                 amountOut = ISwapRouter(swapData.router).exactInput(params);
             }
 
-            // V3 outputs WETH for TOKEN_TO_ETH, need to unwrap
+            // V3 outputs WETH for TOKEN_TO_ETH, need to unwrap and send to recipient
             IWETH(WETH).withdraw(amountOut);
-            payable(msg.sender).transfer(amountOut);
+            payable(recipient).transfer(amountOut);
 
         } else {
-            require(IERC20(swapData.path[0]).transferFrom(msg.sender, address(this), swapData.amountIn), "MonBridgeDex: Token transfer from user failed");
-            feeAccumulatedTokens[swapData.path[0]] += fee;
-
+            // TOKEN_TO_TOKEN: Tokens already transferred to contract and fee accumulated in execute()
             _safeApprove(swapData.path[0], swapData.router, amountForSwap);
 
             if (swapData.path.length == 2) {
@@ -1968,7 +2008,7 @@ contract MonBridgeDex {
                     tokenIn: swapData.path[0],
                     tokenOut: swapData.path[1],
                     fee: swapData.v3Fees[0],
-                    recipient: msg.sender,
+                    recipient: recipient,
                     deadline: swapData.deadline,
                     amountIn: amountForSwap,
                     amountOutMinimum: swapData.amountOutMin,
@@ -1981,7 +2021,7 @@ contract MonBridgeDex {
 
                 ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
                     path: path,
-                    recipient: msg.sender,
+                    recipient: recipient,
                     deadline: swapData.deadline,
                     amountIn: amountForSwap,
                     amountOutMinimum: swapData.amountOutMin
