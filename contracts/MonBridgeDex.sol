@@ -103,6 +103,42 @@ interface ISwapRouter {
     function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
 }
 
+interface IQuoter {
+    function quoteExactInputSingle(
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        uint256 amountIn,
+        uint160 sqrtPriceLimitX96
+    ) external returns (uint256 amountOut);
+
+    function quoteExactInput(bytes memory path, uint256 amountIn) external returns (uint256 amountOut);
+}
+
+interface IQuoterV2 {
+    function quoteExactInputSingle(
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        uint256 amountIn,
+        uint160 sqrtPriceLimitX96
+    ) external returns (
+        uint256 amountOut,
+        uint160 sqrtPriceX96After,
+        uint32 initializedTicksCrossed,
+        uint256 gasEstimate
+    );
+
+    function quoteExactInput(bytes memory path, uint256 amountIn) 
+        external 
+        returns (
+            uint256 amountOut,
+            uint160[] memory sqrtPriceX96AfterList,
+            uint32[] memory initializedTicksCrossedList,
+            uint256 gasEstimate
+        );
+}
+
 interface IERC20 {
     function totalSupply() external view returns (uint);
     function balanceOf(address account) external view returns (uint);
@@ -196,6 +232,7 @@ contract MonBridgeDex {
     mapping(address => bool) public isRouterV2;
     mapping(address => bool) public isRouterV3;
     mapping(address => address) public v3RouterToFactory;
+    mapping(address => address) public v3RouterToQuoter;
     uint public constant MAX_ROUTERS = 100;
     uint public feeAccumulatedETH;
     mapping(address => uint) public feeAccumulatedTokens;
@@ -322,7 +359,7 @@ contract MonBridgeDex {
 
     event RouterV2Added(address router);
     event RouterV2Removed(address router);
-    event RouterV3Added(address router, address factory);
+    event RouterV3Added(address router, address factory, address quoter);
     event RouterV3Removed(address router);
     event SwapExecuted(
         address indexed user,
@@ -405,32 +442,53 @@ contract MonBridgeDex {
         }
     }
 
-    /// @notice Add a V3 router with its factory
-    function addV3Router(address _router, address _factory) external onlyOwner {
+    /// @notice Add a V3 router with its factory and quoter
+    function addV3Router(address _router, address _factory, address _quoter) external onlyOwner {
         require(_router != address(0), "Invalid router address");
         require(_factory != address(0), "Invalid factory address");
+        require(_quoter != address(0), "Invalid quoter address");
         require(!isRouterV3[_router], "V3 Router already added");
         require(routersV3.length < MAX_ROUTERS, "Max routers reached");
+        
+        // Validate factory by checking if it has getPool interface
+        // Try to call getPool with WETH and a known token (or zero addresses for test)
+        try IUniswapV3Factory(_factory).getPool(WETH, WETH, 500) returns (address) {
+            // Factory interface is valid (even if pool doesn't exist, call should not revert)
+        } catch {
+            revert("Invalid V3 factory - getPool interface check failed");
+        }
+        
         routersV3.push(_router);
         isRouterV3[_router] = true;
         v3RouterToFactory[_router] = _factory;
+        v3RouterToQuoter[_router] = _quoter;
         routerInfo[_router].isActive = true;
-        emit RouterV3Added(_router, _factory);
+        emit RouterV3Added(_router, _factory, _quoter);
     }
 
-    /// @notice Add multiple V3 routers with their factories
-    function addV3Routers(address[] calldata _routers, address[] calldata _factories) external onlyOwner {
-        require(_routers.length == _factories.length, "Arrays length mismatch");
+    /// @notice Add multiple V3 routers with their factories and quoters
+    function addV3Routers(address[] calldata _routers, address[] calldata _factories, address[] calldata _quoters) external onlyOwner {
+        require(_routers.length == _factories.length && _routers.length == _quoters.length, "Arrays length mismatch");
         for (uint i = 0; i < _routers.length; i++) {
             require(_routers[i] != address(0), "Invalid router address");
             require(_factories[i] != address(0), "Invalid factory address");
+            require(_quoters[i] != address(0), "Invalid quoter address");
             require(!isRouterV3[_routers[i]], "V3 Router already added");
             require(routersV3.length < MAX_ROUTERS, "Max routers reached");
+            
+            // Validate factory
+            try IUniswapV3Factory(_factories[i]).getPool(WETH, WETH, 500) returns (address) {
+                // Factory interface is valid
+            } catch {
+                revert("Invalid V3 factory - getPool interface check failed");
+            }
+            
             routersV3.push(_routers[i]);
             isRouterV3[_routers[i]] = true;
             v3RouterToFactory[_routers[i]] = _factories[i];
+            v3RouterToQuoter[_routers[i]] = _quoters[i];
             routerInfo[_routers[i]].isActive = true;
-            emit RouterV3Added(_routers[i], _factories[i]);
+            emit RouterV3Added(_routers[i], _factories[i], _quoters[i]);
         }
     }
 
@@ -477,6 +535,7 @@ contract MonBridgeDex {
                 isRouterV3[_router] = false;
                 routerInfo[_router].isActive = false;
                 delete v3RouterToFactory[_router];
+                delete v3RouterToQuoter[_router];
                 emit RouterV3Removed(_router);
                 break;
             }
