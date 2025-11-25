@@ -29,12 +29,12 @@ args = "Serve Frontend"
 name = "Compile Contract"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "npx hardhat compile"
-
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "HARDHAT_DISABLE_TELEMETRY_PROMPT=true npx hardhat compile"
 
 [[workflows.workflow]]
 name = "Serve Frontend"
@@ -53,9 +53,18 @@ localPort = 5000
 externalPort = 80
 
 [[ports]]
+localPort = 37471
+externalPort = 3002
+
+[[ports]]
 localPort = 37647
 externalPort = 3000
 
 [[ports]]
 localPort = 39853
 externalPort = 3001
+
+[userenv]
+
+[userenv.shared]
+HARDHAT_DISABLE_TELEMETRY_PROMPT = "true"
