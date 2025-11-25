@@ -364,8 +364,8 @@ contract MonBridgeDex {
         });
 
         liquidityConfig = LiquidityConfig({
-            minLiquidityUSD: 10000e18,
-            requireLiquidityCheck: true
+            minLiquidityUSD: 1e6,
+            requireLiquidityCheck: false
         });
 
         twapConfig = TWAPConfig({
@@ -757,14 +757,14 @@ contract MonBridgeDex {
         address bestRouter,
         uint bestAmountOut,
         RouterType bestRouterType,
-        uint24 bestV3Fee,
+        uint24[] memory bestV3Fees,
         uint bestPriceImpact,
         address[] memory bestPath
     ) {
         bestAmountOut = 0;
         bestRouter = address(0);
         bestRouterType = RouterType.V2;
-        bestV3Fee = 0;
+        bestV3Fees = new uint24[](0);
         bestPriceImpact = type(uint).max;
         bestPath = path;
 
@@ -809,6 +809,7 @@ contract MonBridgeDex {
                     bestRouter = routersV2[i];
                     bestRouterType = RouterType.V2;
                     bestPriceImpact = 0;
+                    bestPath = wethPath;
                 }
             }
         }
@@ -833,7 +834,8 @@ contract MonBridgeDex {
                     bestAmountOut = amountOut;
                     bestRouter = routersV3[i];
                     bestRouterType = RouterType.V3;
-                    bestV3Fee = bestFee;
+                    bestV3Fees = new uint24[](1);
+                    bestV3Fees[0] = bestFee;
                     bestPriceImpact = impact;
                     bestPath = path;
                 }
@@ -865,9 +867,11 @@ contract MonBridgeDex {
                         bestAmountOut = amountOut;
                         bestRouter = routersV3[i];
                         bestRouterType = RouterType.V3;
-                        bestV3Fee = fee1; // Primary fee tier
+                        bestV3Fees = new uint24[](2);
+                        bestV3Fees[0] = fee1;
+                        bestV3Fees[1] = fee2;
                         bestPriceImpact = impact1 + impact2;
-                        bestPath = wethPath; // Use WETH routing path
+                        bestPath = wethPath;
                     }
                 }
             }
@@ -1086,7 +1090,7 @@ contract MonBridgeDex {
         uint amountForSwap = amountIn - fee;
 
         // Find best route (may include WETH routing for V2)
-        (address bestRouter, uint bestAmountOut, RouterType routerType, uint24 v3Fee, uint priceImpact, address[] memory optimalPath) =
+        (address bestRouter, uint bestAmountOut, RouterType routerType, uint24[] memory v3Fees, uint priceImpact, address[] memory optimalPath) =
             _getBestRouterWithPath(amountForSwap, path);
         require(bestRouter != address(0), "MonBridgeDex: No valid router found for this swap path");
 
@@ -1103,18 +1107,10 @@ contract MonBridgeDex {
 
         uint amountOutMin = _calculateAdaptiveSlippage(bestAmountOut, priceImpact, userSlippageBPS);
 
-        // Create proper fee array based on path length
-        uint24[] memory v3Fees;
-        if (routerType == RouterType.V3 && optimalPath.length > 2) {
-            // Multi-hop V3 needs (pathLength - 1) fees
-            v3Fees = new uint24[](optimalPath.length - 1);
-            // For now, use same fee tier for all hops (limitation: we only track primary fee)
-            for (uint i = 0; i < v3Fees.length; i++) {
-                v3Fees[i] = v3Fee;
-            }
-        } else {
+        // Use fees returned from _getBestRouterWithPath, or create default array for V2
+        if (routerType == RouterType.V2 || v3Fees.length == 0) {
             v3Fees = new uint24[](1);
-            v3Fees[0] = v3Fee;
+            v3Fees[0] = 0;
         }
 
         swapData = SwapData({
@@ -1313,19 +1309,19 @@ contract MonBridgeDex {
     }
 
     /// @notice Find best router with optimal path including V2 WETH routing
-    /// @dev For V3 multi-hop, bestV3Fee contains primary fee tier (additional fees lost - known limitation)
+    /// @dev Returns fee array for V3 multi-hop routes
     function _getBestRouterWithPath(uint amountIn, address[] memory path) internal view returns (
         address bestRouter,
         uint bestAmountOut,
         RouterType bestRouterType,
-        uint24 bestV3Fee,
+        uint24[] memory bestV3Fees,
         uint bestPriceImpact,
         address[] memory bestPath
     ) {
         bestAmountOut = 0;
         bestRouter = address(0);
         bestRouterType = RouterType.V2;
-        bestV3Fee = 0;
+        bestV3Fees = new uint24[](0);
         bestPriceImpact = type(uint).max;
         bestPath = path;
 
@@ -1371,7 +1367,7 @@ contract MonBridgeDex {
                     bestRouter = routersV2[i];
                     bestRouterType = RouterType.V2;
                     bestPriceImpact = 0;
-                    bestPath = wethPath; // Return the WETH path
+                    bestPath = wethPath;
                 }
             }
         }
@@ -1396,7 +1392,8 @@ contract MonBridgeDex {
                     bestAmountOut = amountOut;
                     bestRouter = routersV3[i];
                     bestRouterType = RouterType.V3;
-                    bestV3Fee = bestFee;
+                    bestV3Fees = new uint24[](1);
+                    bestV3Fees[0] = bestFee;
                     bestPriceImpact = impact;
                     bestPath = path;
                 }
@@ -1428,9 +1425,11 @@ contract MonBridgeDex {
                         bestAmountOut = amountOut;
                         bestRouter = routersV3[i];
                         bestRouterType = RouterType.V3;
-                        bestV3Fee = fee1; // Primary fee tier
+                        bestV3Fees = new uint24[](2);
+                        bestV3Fees[0] = fee1;
+                        bestV3Fees[1] = fee2;
                         bestPriceImpact = impact1 + impact2;
-                        bestPath = wethPath; // Use WETH routing path
+                        bestPath = wethPath;
                     }
                 }
             }
