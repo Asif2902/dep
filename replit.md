@@ -6,7 +6,19 @@ MonBridgeDex is a production-grade decentralized exchange (DEX) aggregator deplo
 
 ## Recent Changes
 
-**November 25, 2025 (Latest)**: Fixed critical V3 price calculation causing CALL_EXCEPTION
+**November 25, 2025 (Latest)**: Fixed critical swap execution errors in frontend
+- **CRITICAL FIX**: Fixed BigNumber handling in `executeSwapFlow()` function
+  - **Root Cause**: Ethers.js returns enum values (swapType, routerType) as BigNumber objects, not plain numbers
+  - **Old (Broken)**: `swapType === 0` failed because BigNumber objects cannot be compared with strict equality
+  - **New (Fixed)**: Convert BigNumber to number with `toNumber()` before comparison: `swapTypeNum === 0`
+  - **Result**: "ERC20: transfer amount exceeds allowance" and "Incorrect ETH amount" errors resolved
+- **Fixed**: ETH value now correctly sent as BigNumber for ETH_TO_TOKEN swaps
+- **Fixed**: Token allowance comparison uses proper BigNumber methods (`.lt()`, `.gte()`)
+- **Fixed**: V3 fee tier display correctly handles BigNumber values
+- **Added**: Debug console logging for swap execution troubleshooting
+- **Key Learning**: Always use `Number()` or `.toNumber()` when comparing enum values from ethers.js contract calls
+
+**November 25, 2025 (Earlier)**: Fixed critical V3 price calculation causing CALL_EXCEPTION
 - **CRITICAL FIX**: Rewrote V3 swap output calculation in `_calculateV3SwapOutput` to handle decimal mismatches
   - **Root Cause**: Direct squaring of `sqrtPriceX96` caused overflow; decimal differences truncated output to zero
   - **Old (Broken)**: `priceNumerator = sqrtPriceX96 * sqrtPriceX96` → arithmetic overflow for many pools
