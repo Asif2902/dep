@@ -1,7 +1,7 @@
 {
   "network": "monad",
-  "contractAddress": "0x1c25B561D112be73d5019B7e8521AAB1b7c58F55",
+  "contractAddress": "0x5E5bd2125E4d1C543E3683Bdd2DC4Fe8Cdc1be57",
   "deployer": "0x031183bA19513e5E7B3517a39c461a0CdF0a3116",
-  "deployedAt": "2025-11-25T18:48:09.540Z",
-  "blockNumber": 37957746
+  "deployedAt": "2025-11-25T19:01:40.648Z",
+  "blockNumber": 37959769
 }
