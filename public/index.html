@@ -1624,26 +1624,51 @@
                 const routerTypeText = routerTypeNum === 0 ? 'Uniswap V2' : 'Uniswap V3';
                 const isV3Router = routerTypeNum === 1;
 
-                // Display diagnostics
+                // Display diagnostics with detailed router breakdown
                 let diagHtml = '<div style="background: #e8f5e9; padding: 15px; border-radius: 8px; margin-bottom: 15px;">';
-                diagHtml += '<h4 style="margin: 0 0 10px 0; color: #2e7d32;">✓ Diagnostics Passed</h4>';
+                diagHtml += '<h4 style="margin: 0 0 10px 0; color: #2e7d32;">✓ Quote Found Successfully</h4>';
                 diagHtml += `<p style="margin: 5px 0;"><strong>Routers tested:</strong> ${diagnostics.routerResults.length}</p>`;
                 diagHtml += `<p style="margin: 5px 0;"><strong>Successful routes:</strong> ${successfulRouters.length}</p>`;
                 
-                // Show detailed info about selected router
-                const selectedRoute = diagnostics.routerResults.find(r => r.router === swapData.router);
-                if (selectedRoute) {
-                    if (selectedRoute.type === 'V3' && selectedRoute.liquidity) {
-                        diagHtml += `<p style="margin: 5px 0;"><strong>V3 Pool Liquidity:</strong> ${selectedRoute.liquidity.slice(0, 15)}...</p>`;
-                        if (selectedRoute.allTiers) {
-                            const activeTier = selectedRoute.allTiers.find(t => t.poolExists && t.liquidity && t.liquidity !== '0');
-                            if (activeTier) {
-                                diagHtml += `<p style="margin: 5px 0;"><strong>Fee Tier Used:</strong> ${activeTier.label}</p>`;
-                            }
+                // Show detailed router breakdown
+                diagHtml += '<div style="margin-top: 15px; padding: 10px; background: white; border-radius: 5px;">';
+                diagHtml += '<strong>Router Results:</strong>';
+                diagHtml += '<div style="margin-top: 10px;">';
+                
+                const failedRouters = diagnostics.routerResults.filter(r => r.status === 'failed');
+                
+                // Show successful routers
+                if (successfulRouters.length > 0) {
+                    diagHtml += '<div style="margin-bottom: 10px;"><strong style="color: #2e7d32;">✓ Successful Routers:</strong></div>';
+                    successfulRouters.forEach(result => {
+                        const isSelected = result.router === swapData.router;
+                        diagHtml += `<div style="padding: 8px; margin: 5px 0; background: ${isSelected ? '#c8e6c9' : '#f1f8e9'}; border-radius: 5px; border-left: 3px solid ${isSelected ? '#2e7d32' : '#7cb342'};">`;
+                        diagHtml += `<div style="font-family: monospace; font-size: 0.9em;">${isSelected ? '⭐ ' : ''}${result.type} - ${result.router.slice(0, 10)}...${result.router.slice(-8)}</div>`;
+                        if (result.output) {
+                            diagHtml += `<div style="font-size: 0.85em; color: #555; margin-top: 3px;">Output: ${result.output.slice(0, 20)}...</div>`;
                         }
-                    }
+                        if (result.pool && result.fee) {
+                            diagHtml += `<div style="font-size: 0.85em; color: #555; margin-top: 3px;">Pool: ${result.pool.slice(0, 10)}... | Fee: ${result.fee / 10000}%</div>`;
+                        }
+                        if (isSelected) {
+                            diagHtml += `<div style="font-size: 0.85em; color: #1b5e20; margin-top: 3px; font-weight: bold;">⭐ Selected as Best Route</div>`;
+                        }
+                        diagHtml += '</div>';
+                    });
                 }
                 
+                // Show failed routers
+                if (failedRouters.length > 0) {
+                    diagHtml += `<div style="margin-top: 15px; margin-bottom: 10px;"><strong style="color: #c62828;">✗ Failed Routers (${failedRouters.length}):</strong></div>`;
+                    failedRouters.forEach(result => {
+                        diagHtml += `<div style="padding: 8px; margin: 5px 0; background: #ffebee; border-radius: 5px; border-left: 3px solid #c62828;">`;
+                        diagHtml += `<div style="font-family: monospace; font-size: 0.9em;">${result.type} - ${result.router.slice(0, 10)}...${result.router.slice(-8)}</div>`;
+                        diagHtml += `<div style="font-size: 0.85em; color: #c62828; margin-top: 3px;">Reason: ${result.error}</div>`;
+                        diagHtml += '</div>';
+                    });
+                }
+                
+                diagHtml += '</div></div>';
                 diagHtml += '</div>';
 
                 const v3FeesDisplay = isV3Router && swapData.v3Fees && swapData.v3Fees.length > 0 
