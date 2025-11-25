@@ -6,16 +6,18 @@ MonBridgeDex is a production-grade decentralized exchange (DEX) aggregator deplo
 
 ## Recent Changes
 
-**November 25, 2025 (Latest)**: Fixed critical V3 price impact calculation causing CALL_EXCEPTION
-- **CRITICAL FIX**: Replaced broken liquidity-based price impact calculation in `_calculateV3SwapOutput`
-  - Old: `priceImpact = (amountIn * 10000) / (liquidity * 100)` - treated V3 liquidity as simple amount, caused 100% impact
-  - New: Heuristic-based approach using fee tiers: `priceImpact = feeTierBPS * 2`, capped at 2000 BPS (20%)
-  - Result: V3 pools now properly scored and selected instead of being filtered out
-- **Fixed**: Removed hardcoded 3% slippage reduction, now uses configurable `baseSlippageBPS` from slippageConfig
-- **Added**: Fallback scoring in `_getBestV3Pool` to prevent all pools from scoring zero
+**November 25, 2025 (Latest)**: Fixed critical V3 price calculation causing CALL_EXCEPTION
+- **CRITICAL FIX**: Rewrote V3 swap output calculation in `_calculateV3SwapOutput` to handle decimal mismatches
+  - **Root Cause**: Direct squaring of `sqrtPriceX96` caused overflow; decimal differences truncated output to zero
+  - **Old (Broken)**: `priceNumerator = sqrtPriceX96 * sqrtPriceX96` → arithmetic overflow for many pools
+  - **New (Fixed)**: Two-step `FullMath.mulDiv` using `FixedPoint96.Q96` constant to avoid overflow
+  - **Result**: V3 quotes now return positive amounts for USDC/WETH and all token pairs
+- **Fixed**: Removed double decimal adjustment (V3 price already encodes token decimals)
+- **Fixed**: Removed hardcoded 3% slippage, now uses configurable `baseSlippageBPS`
+- **Added**: Fallback scoring in `_getBestV3Pool` to prevent zero-score filtering
 - **Improved**: Error messages in routing functions for better debugging
-- **Root Cause**: Previous impact calculation made all V3 pools score 0 → `bestRouter = address(0)` → CALL_EXCEPTION
-- Contract compiles successfully at 36,869 bytes (within Monad's 128KB limit)
+- **Impact**: CALL_EXCEPTION resolved - getBestSwapData now successfully returns V3 routes
+- Contract compiles successfully at 37,422 bytes (within Monad's 128KB limit)
 
 **November 25, 2025 (Earlier)**: Fixed critical routing and validation issues
 - Added proper V2 pair validation with token sorting to match Uniswap V2 factory storage
