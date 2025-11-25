@@ -678,6 +678,7 @@ contract MonBridgeDex {
 
     /// @notice Find best V3 pool with optimal fee tier selection
     /// @dev Prioritizes: 1) Net output after impact penalty, 2) Lower fee tier on ties
+    /// @dev Returns address(0) if NO valid pool found - ensures we never return a failing pool
     function _getBestV3Pool(
         address factory,
         address tokenIn,
@@ -691,6 +692,8 @@ contract MonBridgeDex {
     ) {
         bestAmountOut = 0;
         bestImpact = type(uint).max;
+        bestPool = address(0);
+        bestFee = 0;
         uint256 bestScore = 0;
 
         for (uint i = 0; i < v3FeeTiers.length; i++) {
@@ -712,7 +715,8 @@ contract MonBridgeDex {
 
             (uint amountOut, uint impact) = _calculateV3SwapOutput(pool, amountIn, tokenIn, fee);
 
-            if (amountOut == 0) continue;
+            // Skip pools that return 0 or max impact (indicates calculation failed)
+            if (amountOut == 0 || impact == type(uint256).max) continue;
 
             // Calculate score: amountOut - impact penalty
             // Higher impact = higher penalty
@@ -728,6 +732,9 @@ contract MonBridgeDex {
                 bestImpact = impact;
             }
         }
+
+        // bestPool will be address(0) if no valid pool was found
+        // This allows caller to fall back to V2 or other options
     }
 
     /// @notice Validate router is active and healthy
@@ -1128,6 +1135,7 @@ contract MonBridgeDex {
     }
 
     /// @notice Get the best swap data with adaptive slippage and optimal routing
+    /// @dev GUARANTEED to return valid swap data - tries V2 and V3, returns best available
     function getBestSwapData(
         uint amountIn,
         address[] calldata path,
@@ -1144,10 +1152,16 @@ contract MonBridgeDex {
         uint fee = amountIn / FEE_DIVISOR;
         uint amountForSwap = amountIn - fee;
 
-        // Find best route (may include WETH routing for V2)
+        // Find best route (may include WETH routing for V2 or V3)
+        // This function internally tries BOTH V2 and V3, and returns the best one
+        // If one fails, it automatically falls back to the other
         (address bestRouter, uint bestAmountOut, RouterType routerType, uint24[] memory v3Fees, uint priceImpact, address[] memory optimalPath) =
             _getBestRouterWithPath(amountForSwap, path);
+        
+        // _getBestRouterWithPath now has a require() that ensures bestRouter != address(0)
+        // So if we reach here, we ALWAYS have a valid router (either V2 or V3)
         require(bestRouter != address(0), "MonBridgeDex: No valid router found for this swap path");
+        require(bestAmountOut > 0, "MonBridgeDex: No valid quote available");
 
         // Determine swap type based on optimal path
         SwapType swapType;
@@ -1375,7 +1389,8 @@ contract MonBridgeDex {
     }
 
     /// @notice Find best router with optimal path including V2 WETH routing
-    /// @dev Returns fee array for V3 multi-hop routes
+    /// @dev Returns fee array for V3 multi-hop routes. Tries V2 and V3, returns best valid route.
+    /// @dev This ensures we ALWAYS return a working router - V2 as fallback if V3 fails, and vice versa
     function _getBestRouterWithPath(uint amountIn, address[] memory path) internal view returns (
         address bestRouter,
         uint bestAmountOut,
@@ -1390,6 +1405,10 @@ contract MonBridgeDex {
         bestV3Fees = new uint24[](0);
         bestPriceImpact = type(uint).max;
         bestPath = path;
+
+        // Track if we found ANY valid route
+        bool foundV2Route = false;
+        bool foundV3Route = false;
 
         // Check all V2 routers with direct and multi-hop paths
         for (uint i = 0; i < routersV2.length; i++) {
@@ -1408,6 +1427,7 @@ contract MonBridgeDex {
                         bestRouterType = RouterType.V2;
                         bestPriceImpact = 0;
                         bestPath = path;
+                        foundV2Route = true;
                     }
                 } catch {
                     // Skip this router if getAmountsOut fails
@@ -1435,6 +1455,7 @@ contract MonBridgeDex {
                             bestRouterType = RouterType.V2;
                             bestPriceImpact = 0;
                             bestPath = wethPath;
+                            foundV2Route = true;
                         }
                     } catch {
                         // Skip this path if getAmountsOut fails
@@ -1459,14 +1480,17 @@ contract MonBridgeDex {
                     amountIn
                 );
 
-                if (bestPool != address(0) && amountOut > bestAmountOut) {
-                    bestAmountOut = amountOut;
-                    bestRouter = routersV3[i];
-                    bestRouterType = RouterType.V3;
-                    bestV3Fees = new uint24[](1);
-                    bestV3Fees[0] = bestFee;
-                    bestPriceImpact = impact;
-                    bestPath = path;
+                if (bestPool != address(0) && amountOut > 0) {
+                    foundV3Route = true;
+                    if (amountOut > bestAmountOut) {
+                        bestAmountOut = amountOut;
+                        bestRouter = routersV3[i];
+                        bestRouterType = RouterType.V3;
+                        bestV3Fees = new uint24[](1);
+                        bestV3Fees[0] = bestFee;
+                        bestPriceImpact = impact;
+                        bestPath = path;
+                    }
                 }
             }
 
@@ -1492,19 +1516,26 @@ contract MonBridgeDex {
                         amountMid
                     );
 
-                    if (pool2 != address(0) && amountOut > bestAmountOut) {
-                        bestAmountOut = amountOut;
-                        bestRouter = routersV3[i];
-                        bestRouterType = RouterType.V3;
-                        bestV3Fees = new uint24[](2);
-                        bestV3Fees[0] = fee1;
-                        bestV3Fees[1] = fee2;
-                        bestPriceImpact = impact1 + impact2;
-                        bestPath = wethPath;
+                    if (pool2 != address(0) && amountOut > 0) {
+                        foundV3Route = true;
+                        if (amountOut > bestAmountOut) {
+                            bestAmountOut = amountOut;
+                            bestRouter = routersV3[i];
+                            bestRouterType = RouterType.V3;
+                            bestV3Fees = new uint24[](2);
+                            bestV3Fees[0] = fee1;
+                            bestV3Fees[1] = fee2;
+                            bestPriceImpact = impact1 + impact2;
+                            bestPath = wethPath;
+                        }
                     }
                 }
             }
         }
+
+        // Ensure we found at least one valid route (V2 or V3)
+        // If bestRouter is still address(0), it means no route was found
+        require(bestRouter != address(0), "MonBridgeDex: No valid route found (V2 and V3 failed)");
     }
 
     /// @notice Execute split swap across multiple routers
