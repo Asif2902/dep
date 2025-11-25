@@ -1618,7 +1618,11 @@
 
                 currentQuote = swapData;
 
-                const routerTypeText = swapData.routerType === 0 ? 'Uniswap V2' : 'Uniswap V3';
+                const routerTypeNum = typeof swapData.routerType === 'object' 
+                    ? swapData.routerType.toNumber() 
+                    : Number(swapData.routerType);
+                const routerTypeText = routerTypeNum === 0 ? 'Uniswap V2' : 'Uniswap V3';
+                const isV3Router = routerTypeNum === 1;
 
                 // Display diagnostics
                 let diagHtml = '<div style="background: #e8f5e9; padding: 15px; border-radius: 8px; margin-bottom: 15px;">';
@@ -1641,6 +1645,13 @@
                 }
                 
                 diagHtml += '</div>';
+
+                const v3FeesDisplay = isV3Router && swapData.v3Fees && swapData.v3Fees.length > 0 
+                    ? swapData.v3Fees.map(f => {
+                        const feeNum = typeof f === 'object' ? f.toNumber() : Number(f);
+                        return `${feeNum / 10000}%`;
+                    }).join(', ')
+                    : '';
 
                 document.getElementById('quoteResult').innerHTML = diagHtml + `
                     <div class="quote-card">
@@ -1665,10 +1676,10 @@
                             <span class="quote-label">Path:</span>
                             <span class="quote-value">${swapData.path.join(' → ')}</span>
                         </div>
-                        ${swapData.routerType === 1 && swapData.v3Fees.length > 0 ? `
+                        ${isV3Router && v3FeesDisplay ? `
                         <div class="quote-row">
                             <span class="quote-label">V3 Fees:</span>
-                            <span class="quote-value">${swapData.v3Fees.map(f => `${f / 10000}%`).join(', ')}</span>
+                            <span class="quote-value">${v3FeesDisplay}</span>
                         </div>
                         ` : ''}
                         <div class="quote-row">
@@ -1807,7 +1818,22 @@
             }
 
             const tokenIn = currentQuote.path[0];
-            const isETHSwap = currentQuote.swapType === 0; // ETH_TO_TOKEN
+            const swapTypeNum = typeof currentQuote.swapType === 'object' 
+                ? currentQuote.swapType.toNumber() 
+                : Number(currentQuote.swapType);
+            const isETHSwap = swapTypeNum === 0; // ETH_TO_TOKEN = 0
+            const isTokenToETH = swapTypeNum === 1; // TOKEN_TO_ETH = 1
+            const isTokenToToken = swapTypeNum === 2; // TOKEN_TO_TOKEN = 2
+
+            console.log('Swap execution debug:', {
+                swapType: swapTypeNum,
+                isETHSwap,
+                isTokenToETH,
+                isTokenToToken,
+                tokenIn,
+                amountIn: currentQuote.amountIn.toString(),
+                path: currentQuote.path
+            });
 
             // Show flow
             document.getElementById('swapFlow').innerHTML = `
@@ -1828,18 +1854,25 @@
             `;
 
             try {
-                // Step 1 & 2: Only for token swaps (not ETH)
+                // Step 1 & 2: Only for token swaps (not ETH_TO_TOKEN)
                 if (!isETHSwap) {
                     document.getElementById('step1').classList.add('active');
                     showMessage('swapMessage', 'Checking token allowance...', 'info');
 
                     const tokenContract = new ethers.Contract(tokenIn, ERC20_ABI, signer);
                     const allowance = await tokenContract.allowance(userAddress, contractConfig.contractAddress);
+                    const amountInBN = ethers.BigNumber.from(currentQuote.amountIn);
+
+                    console.log('Allowance check:', {
+                        allowance: allowance.toString(),
+                        required: amountInBN.toString(),
+                        sufficient: allowance.gte(amountInBN)
+                    });
 
                     document.getElementById('step1').classList.remove('active');
                     document.getElementById('step1').classList.add('completed');
 
-                    if (allowance.lt(currentQuote.amountIn)) {
+                    if (allowance.lt(amountInBN)) {
                         document.getElementById('step2').classList.add('active');
                         showMessage('swapMessage', 'Approval needed. Please confirm the transaction...', 'info');
 
@@ -1867,7 +1900,15 @@
                 document.getElementById('step3').classList.add('active');
                 showMessage('swapMessage', 'Executing swap. Please confirm the transaction...', 'info');
 
-                const value = isETHSwap ? currentQuote.amountIn : 0;
+                const amountInBN = ethers.BigNumber.from(currentQuote.amountIn);
+                const value = isETHSwap ? amountInBN : ethers.BigNumber.from(0);
+
+                console.log('Execute swap with:', {
+                    value: value.toString(),
+                    amountIn: amountInBN.toString(),
+                    isETHSwap
+                });
+
                 const swapTx = await contract.execute(currentQuote, { value });
 
                 showMessage('swapMessage', 'Waiting for swap confirmation...', 'info');
@@ -1887,7 +1928,16 @@
 
             } catch (error) {
                 console.error('Error executing swap:', error);
-                showMessage('swapMessage', `Error: ${error.message || error}`, 'error');
+                
+                let errorMsg = error.message || String(error);
+                if (error.reason) {
+                    errorMsg = error.reason;
+                }
+                if (error.data && error.data.message) {
+                    errorMsg = error.data.message;
+                }
+                
+                showMessage('swapMessage', `Error: ${errorMsg}`, 'error');
 
                 // Reset flow indicators
                 document.querySelectorAll('.step-indicator').forEach(step => {
