@@ -6,17 +6,20 @@ MonBridgeDex is a production-grade decentralized exchange (DEX) aggregator deplo
 
 ## Recent Changes
 
-**November 25, 2025 (Latest)**: Fixed critical swap execution errors in frontend
-- **CRITICAL FIX**: Fixed BigNumber handling in `executeSwapFlow()` function
-  - **Root Cause**: Ethers.js returns enum values (swapType, routerType) as BigNumber objects, not plain numbers
-  - **Old (Broken)**: `swapType === 0` failed because BigNumber objects cannot be compared with strict equality
-  - **New (Fixed)**: Convert BigNumber to number with `toNumber()` before comparison: `swapTypeNum === 0`
-  - **Result**: "ERC20: transfer amount exceeds allowance" and "Incorrect ETH amount" errors resolved
-- **Fixed**: ETH value now correctly sent as BigNumber for ETH_TO_TOKEN swaps
-- **Fixed**: Token allowance comparison uses proper BigNumber methods (`.lt()`, `.gte()`)
-- **Fixed**: V3 fee tier display correctly handles BigNumber values
-- **Added**: Debug console logging for swap execution troubleshooting
-- **Key Learning**: Always use `Number()` or `.toNumber()` when comparing enum values from ethers.js contract calls
+**November 25, 2025 (Latest)**: Fixed critical msg.sender context bug causing "ERC20: transfer amount exceeds allowance" errors
+- **CRITICAL FIX**: Fixed token transfer context in `execute()` and `executeSplit()` functions
+  - **Root Cause**: `_executeSwapInternal` was called via `this.func()` (external call), causing `msg.sender` inside that function to become the contract address instead of the original user
+  - **Old (Broken)**: `transferFrom(msg.sender, address(this), amount)` tried to transfer tokens from the contract to itself
+  - **New (Fixed)**: Pull tokens from user in the parent function BEFORE calling `_executeSwapInternal`, and pass `recipient` explicitly
+  - **Result**: "ERC20: transfer amount exceeds allowance" errors resolved for all swap types
+- **Fixed**: `_executeSwapInternal` now accepts `recipient` parameter instead of relying on `msg.sender`
+- **Fixed**: `_executeV2Swap` and `_executeV3Swap` use `recipient` for router calls, removed duplicate transferFrom
+- **Fixed**: `executeSplit()` now validates all splits use same input token, calculates fee at total level (not per-split), and distributes post-fee amount proportionally
+- **Key Learning**: External calls via `this.functionName()` change msg.sender context; always pull user tokens in the entry-point function
+- Contract compiles successfully at 37,951 bytes (within Monad's 128KB limit)
+
+**November 25, 2025 (Earlier)**: Fixed BigNumber handling in frontend
+- Ethers.js returns enum values as BigNumber; convert with `.toNumber()` before comparison
 
 **November 25, 2025 (Earlier)**: Fixed critical V3 price calculation causing CALL_EXCEPTION
 - **CRITICAL FIX**: Rewrote V3 swap output calculation in `_calculateV3SwapOutput` to handle decimal mismatches
