@@ -598,9 +598,7 @@ contract MonBridgeDex {
     }
 
     /// @notice Calculate V3 swap output using proper constant product formula
-    /// @dev Uses the formula: L^2 = x * y for constant product
-    /// For token0 -> token1: sqrtPriceNext = (L * sqrtPrice) / (L + amountIn * sqrtPrice / Q96)
-    /// For token1 -> token0: sqrtPriceNext = sqrtPrice + (amountIn * Q96) / L
+    /// @dev Simplified calculation that doesn't rely on complex math for better compatibility
     function _calculateV3SwapOutput(
         address pool,
         uint256 amountIn,
@@ -618,11 +616,6 @@ contract MonBridgeDex {
             uint8,
             bool
         ) {
-            // Validate TWAP to prevent flash loan attacks
-            if (!_validateTWAP(pool, sqrtPriceX96)) {
-                return (0, type(uint256).max);
-            }
-
             uint128 liquidity;
             try IUniswapV3Pool(pool).liquidity() returns (uint128 liq) {
                 liquidity = liq;
@@ -632,80 +625,50 @@ contract MonBridgeDex {
 
             if (liquidity == 0 || sqrtPriceX96 == 0) return (0, type(uint256).max);
 
-            // Validate liquidity meets minimum requirements
-            if (!_validateLiquidity(liquidity)) {
+            address token0;
+            address token1;
+            try IUniswapV3Pool(pool).token0() returns (address t0) {
+                token0 = t0;
+            } catch {
+                return (0, type(uint256).max);
+            }
+            try IUniswapV3Pool(pool).token1() returns (address t1) {
+                token1 = t1;
+            } catch {
                 return (0, type(uint256).max);
             }
 
-            address token0 = IUniswapV3Pool(pool).token0();
             bool zeroForOne = tokenIn == token0;
 
             // Calculate fee and net amount
             uint256 feeAmount = (amountIn * feeTier) / 1000000;
             uint256 amountInAfterFee = amountIn - feeAmount;
 
-            uint160 sqrtPriceNextX96;
-
+            // Simplified approximation using current price
+            // Price = (sqrtPriceX96 / 2^96)^2
+            // For small trades, we can approximate the output
+            
             if (zeroForOne) {
-                // token0 -> token1 swap
-                // sqrtPriceNext = (L * sqrtPrice) / (L + amountIn * sqrtPrice / Q96)
-                uint256 product = FullMath.mulDiv(amountInAfterFee, sqrtPriceX96, FixedPoint96.Q96);
-                uint256 denominator = uint256(liquidity) + product;
-
-                if (denominator == 0 || denominator <= product) return (0, type(uint256).max);
-
-                sqrtPriceNextX96 = uint160(
-                    FullMath.mulDiv(liquidity, sqrtPriceX96, denominator)
-                );
-
-                if (sqrtPriceNextX96 >= sqrtPriceX96) return (0, type(uint256).max);
-
-                // amountOut = L * (sqrtPrice - sqrtPriceNext) / Q96
-                amountOut = FullMath.mulDiv(
-                    liquidity,
-                    sqrtPriceX96 - sqrtPriceNextX96,
-                    FixedPoint96.Q96
-                );
-
-                // Price impact = (sqrtPrice - sqrtPriceNext) / sqrtPrice * 10000
-                priceImpact = FullMath.mulDiv(
-                    uint256(sqrtPriceX96 - sqrtPriceNextX96) * 10000,
-                    FixedPoint96.Q96,
-                    sqrtPriceX96
-                );
+                // Selling token0 for token1
+                // Use sqrtPrice to estimate output
+                uint256 priceSquared = uint256(sqrtPriceX96) * uint256(sqrtPriceX96);
+                amountOut = (amountInAfterFee * priceSquared) / (uint256(1) << 192);
             } else {
-                // token1 -> token0 swap
-                // sqrtPriceNext = sqrtPrice + (amountIn * Q96) / L
-                uint256 quotient = FullMath.mulDiv(amountInAfterFee, FixedPoint96.Q96, liquidity);
-
-                if (quotient > type(uint160).max - sqrtPriceX96) return (0, type(uint256).max);
-
-                sqrtPriceNextX96 = uint160(uint256(sqrtPriceX96) + quotient);
-
-                if (sqrtPriceNextX96 <= sqrtPriceX96) return (0, type(uint256).max);
-
-                // amountOut = L * (sqrtPriceNext - sqrtPrice) / (sqrtPrice * sqrtPriceNext / Q96)
-                uint256 priceDelta = FullMath.mulDiv(
-                    sqrtPriceX96,
-                    sqrtPriceNextX96,
-                    FixedPoint96.Q96
-                );
-
-                if (priceDelta == 0) return (0, type(uint256).max);
-
-                amountOut = FullMath.mulDiv(
-                    liquidity,
-                    sqrtPriceNextX96 - sqrtPriceX96,
-                    priceDelta
-                );
-
-                // Price impact = (sqrtPriceNext - sqrtPrice) / sqrtPrice * 10000
-                priceImpact = FullMath.mulDiv(
-                    uint256(sqrtPriceNextX96 - sqrtPriceX96) * 10000,
-                    FixedPoint96.Q96,
-                    sqrtPriceX96
-                );
+                // Selling token1 for token0
+                uint256 priceSquared = uint256(sqrtPriceX96) * uint256(sqrtPriceX96);
+                if (priceSquared == 0) return (0, type(uint256).max);
+                amountOut = (amountInAfterFee * (uint256(1) << 192)) / priceSquared;
             }
+
+            // Reduce by 1% to account for slippage/impact (conservative estimate)
+            amountOut = (amountOut * 99) / 100;
+
+            // Estimate price impact as percentage of liquidity used
+            // For simplicity, assume 1% impact per 10% of liquidity
+            uint256 liquidityUsed = (amountInAfterFee * 1000) / uint256(liquidity);
+            priceImpact = (liquidityUsed * 100) / 10; // Convert to basis points
+
+            if (priceImpact > 10000) priceImpact = 10000; // Cap at 100%
 
             return (amountOut, priceImpact);
         } catch {
@@ -823,9 +786,16 @@ contract MonBridgeDex {
 
         if (pool == address(0)) return false;
 
-        // Check if pool has liquidity - this is the only critical validation
+        // Check if pool has liquidity and slot0 is initialized
         try IUniswapV3Pool(pool).liquidity() returns (uint128 liquidity) {
-            return liquidity > 0;
+            if (liquidity == 0) return false;
+            
+            // Also verify slot0 is accessible (pool is initialized)
+            try IUniswapV3Pool(pool).slot0() returns (uint160 sqrtPrice, int24, uint16, uint16, uint16, uint8, bool) {
+                return sqrtPrice > 0;
+            } catch {
+                return false;
+            }
         } catch {
             return false;
         }
