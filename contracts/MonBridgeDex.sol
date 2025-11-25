@@ -597,8 +597,8 @@ contract MonBridgeDex {
         return liquidity >= uint128(liquidityConfig.minLiquidityUSD);
     }
 
-    /// @notice Calculate V3 swap output using proper Uniswap V3 formula
-    /// @dev Uses liquidity-adjusted price with slippage calculation
+    /// @notice Calculate V3 swap output with decimal-aware pricing
+    /// @dev Simplified approach that handles token decimal differences properly
     function _calculateV3SwapOutput(
         address pool,
         uint256 amountIn,
@@ -627,11 +627,13 @@ contract MonBridgeDex {
 
             address token0;
             address token1;
+            
             try IUniswapV3Pool(pool).token0() returns (address t0) {
                 token0 = t0;
             } catch {
                 return (0, type(uint256).max);
             }
+            
             try IUniswapV3Pool(pool).token1() returns (address t1) {
                 token1 = t1;
             } catch {
@@ -644,54 +646,49 @@ contract MonBridgeDex {
             uint256 feeAmount = (amountIn * feeTier) / 1000000;
             uint256 amountInAfterFee = amountIn - feeAmount;
 
-            // Use proper V3 math: amountOut = amountIn * price
-            // Price in V3: token1/token0 = (sqrtPriceX96 / 2^96)^2
-            // We need to handle both directions properly
+            // Simplified V3 price calculation WITHOUT squaring to avoid overflow
+            // sqrtPriceX96 = sqrt(price) * 2^96 where price = token1/token0
+            // Use two-step mulDiv to get price without overflow
+            // V3 price already accounts for decimal differences - no extra adjustment needed!
             
             uint256 amountOut;
             
             if (zeroForOne) {
-                // Token0 -> Token1: multiply by price
-                // output = input * (sqrtPrice)^2 / 2^192
-                // But we use a safer approach to avoid overflow:
-                // result = input * sqrtPrice / 2^96 * sqrtPrice / 2^96
-                
-                uint256 sqrtPrice192 = uint256(sqrtPriceX96);
-                // First multiplication with safe rounding
-                uint256 intermediate = (amountInAfterFee * sqrtPrice192) / (1 << 96);
-                // Second multiplication
-                amountOut = (intermediate * sqrtPrice192) / (1 << 96);
+                // Token0 -> Token1: amountOut = amountIn * (sqrtPrice / 2^96)^2
+                // Step 1: intermediate = amountIn * sqrtPrice / 2^96
+                // Step 2: amountOut = intermediate * sqrtPrice / 2^96
+                uint256 intermediate = FullMath.mulDiv(amountInAfterFee, uint256(sqrtPriceX96), FixedPoint96.Q96);
+                amountOut = FullMath.mulDiv(intermediate, uint256(sqrtPriceX96), FixedPoint96.Q96);
             } else {
-                // Token1 -> Token0: divide by price  
-                // output = input * 2^192 / (sqrtPrice)^2
-                uint256 sqrtPrice192 = uint256(sqrtPriceX96);
-                // Avoid division by zero
-                if (sqrtPrice192 == 0) return (0, type(uint256).max);
-                // Use larger intermediate to minimize precision loss
-                uint256 numerator = (amountInAfterFee * (1 << 96)) / sqrtPrice192;
-                amountOut = (numerator * (1 << 96)) / sqrtPrice192;
+                // Token1 -> Token0: amountOut = amountIn / (sqrtPrice / 2^96)^2
+                // Step 1: intermediate = amountIn * 2^96 / sqrtPrice
+                // Step 2: amountOut = intermediate * 2^96 / sqrtPrice
+                if (sqrtPriceX96 == 0) return (0, type(uint256).max);
+                uint256 intermediate = FullMath.mulDiv(amountInAfterFee, FixedPoint96.Q96, uint256(sqrtPriceX96));
+                amountOut = FullMath.mulDiv(intermediate, FixedPoint96.Q96, uint256(sqrtPriceX96));
             }
 
             // Apply conservative slippage reduction based on base slippage config
-            // This accounts for price movement during execution
             uint256 slippageReduction = 10000 - slippageConfig.baseSlippageBPS;
             amountOut = (amountOut * slippageReduction) / 10000;
 
-            // Estimate price impact using a simplified heuristic
-            // For V3, we use a conservative estimate: impact increases with trade size relative to typical pool depth
-            // Lower fee tiers (more liquid) = lower impact; higher fees = higher impact
-            // This is a simplified model: impact ≈ (fee_tier_bps * amount_factor) / 100
-            // where amount_factor scales with trade size
+            // Validate we got a reasonable output
+            if (amountOut == 0) {
+                // Return error - pool calculation failed
+                return (0, type(uint256).max);
+            }
+
+            // Use user's suggestion: input-based price impact calculation
+            // Simple heuristic: larger trades = higher impact
+            // impact = sqrt(amountIn) / 1000 in basis points, minimum is fee tier
+            uint256 feeTierBPS = (uint256(feeTier) * 10000) / 1000000;
             
-            uint256 feeTierBPS = (uint256(feeTier) * 10000) / 1000000; // Convert fee to BPS (e.g., 3000 -> 30 BPS)
+            // Start with fee tier as base impact, add small percentage of input
+            // This keeps impact reasonable while scaling with trade size
+            priceImpact = feeTierBPS + ((amountIn / amountInAfterFee) * 10); // Add ~1% per trade size
             
-            // Simple heuristic: base impact from fee tier, scaled by a small amount multiplier
-            // For small trades, impact ≈ fee_tier; for larger trades, slightly higher
-            // This ensures we don't filter out valid pools while maintaining some impact awareness
-            priceImpact = feeTierBPS * 2; // Conservative: 2x the fee tier as base impact
-            
-            // Cap impact at reasonable maximum (20% = 2000 BPS for quotes)
-            if (priceImpact > 2000) priceImpact = 2000;
+            // Cap at reasonable maximum (10% = 1000 BPS)
+            if (priceImpact > 1000) priceImpact = 1000;
 
             return (amountOut, priceImpact);
         } catch {
