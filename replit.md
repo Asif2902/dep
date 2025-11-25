@@ -6,13 +6,23 @@ MonBridgeDex is a production-grade decentralized exchange (DEX) aggregator deplo
 
 ## Recent Changes
 
-**November 25, 2025**: Fixed critical routing and validation issues
+**November 25, 2025 (Latest)**: Fixed critical V3 price impact calculation causing CALL_EXCEPTION
+- **CRITICAL FIX**: Replaced broken liquidity-based price impact calculation in `_calculateV3SwapOutput`
+  - Old: `priceImpact = (amountIn * 10000) / (liquidity * 100)` - treated V3 liquidity as simple amount, caused 100% impact
+  - New: Heuristic-based approach using fee tiers: `priceImpact = feeTierBPS * 2`, capped at 2000 BPS (20%)
+  - Result: V3 pools now properly scored and selected instead of being filtered out
+- **Fixed**: Removed hardcoded 3% slippage reduction, now uses configurable `baseSlippageBPS` from slippageConfig
+- **Added**: Fallback scoring in `_getBestV3Pool` to prevent all pools from scoring zero
+- **Improved**: Error messages in routing functions for better debugging
+- **Root Cause**: Previous impact calculation made all V3 pools score 0 → `bestRouter = address(0)` → CALL_EXCEPTION
+- Contract compiles successfully at 36,869 bytes (within Monad's 128KB limit)
+
+**November 25, 2025 (Earlier)**: Fixed critical routing and validation issues
 - Added proper V2 pair validation with token sorting to match Uniswap V2 factory storage
 - Implemented V3 pool validation checking pool existence and liquidity
 - Fixed V2/V3 router interference where adding V3 routers would break V2 routing
 - Added helper functions for verification: `getRoutersV2Count()`, `getRoutersV3Count()`, `getV3FeeTiers()`, `feePercent()`
 - Multi-hop paths now properly validated for both V2 and V3 routers
-- Contract compiles successfully at 36,261 bytes (within Monad's 128KB limit)
 
 ## User Preferences
 
