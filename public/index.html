@@ -1459,16 +1459,136 @@
                     diagnostics
                 });
 
-                // Check 4: Call contract's getBestSwapData
+                // Check 4: Call contract's getBestSwapData with detailed V3 debugging
                 diagnostics.checks.push({ name: 'Contract Quote', status: 'checking' });
-                const swapData = await contract.getBestSwapData(
-                    amountIn,
-                    path,
-                    false,
-                    slippageBPS
-                );
-                diagnostics.checks[3].status = 'passed';
-                diagnostics.success = true;
+                
+                // Before calling getBestSwapData, test V3 pools directly
+                const v3DebugResults = [];
+                for (const router of v3Routers) {
+                    const factory = await contract.v3RouterToFactory(router);
+                    if (factory === '0x0000000000000000000000000000000000000000') continue;
+
+                    const factoryContract = new ethers.Contract(
+                        factory,
+                        ['function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool)'],
+                        provider
+                    );
+
+                    const feeTiers = [100, 500, 3000, 10000];
+                    for (const fee of feeTiers) {
+                        try {
+                            const pool = await factoryContract.getPool(tokenIn, tokenOut, fee);
+                            
+                            if (pool && pool !== '0x0000000000000000000000000000000000000000') {
+                                // Check pool liquidity and slot0
+                                const poolContract = new ethers.Contract(
+                                    pool,
+                                    [
+                                        'function liquidity() external view returns (uint128)',
+                                        'function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+                                        'function token0() external view returns (address)',
+                                        'function token1() external view returns (address)'
+                                    ],
+                                    provider
+                                );
+
+                                try {
+                                    const liquidity = await poolContract.liquidity();
+                                    const slot0 = await poolContract.slot0();
+                                    const token0 = await poolContract.token0();
+                                    const token1 = await poolContract.token1();
+
+                                    v3DebugResults.push({
+                                        router,
+                                        factory,
+                                        pool,
+                                        fee,
+                                        liquidity: liquidity.toString(),
+                                        sqrtPriceX96: slot0.sqrtPriceX96.toString(),
+                                        tick: slot0.tick.toString(),
+                                        unlocked: slot0.unlocked,
+                                        token0,
+                                        token1,
+                                        zeroForOne: tokenIn.toLowerCase() === token0.toLowerCase(),
+                                        status: 'Pool Valid',
+                                        hasLiquidity: !liquidity.isZero(),
+                                        hasPriceData: !slot0.sqrtPriceX96.isZero()
+                                    });
+                                } catch (e) {
+                                    v3DebugResults.push({
+                                        router,
+                                        factory,
+                                        pool,
+                                        fee,
+                                        status: 'Pool Query Failed',
+                                        error: e.message
+                                    });
+                                }
+                            }
+                        } catch (e) {
+                            // getPool call failed
+                        }
+                    }
+                }
+
+                diagnostics.v3DebugResults = v3DebugResults;
+
+                // Now try the actual contract call
+                try {
+                    const swapData = await contract.getBestSwapData(
+                        amountIn,
+                        path,
+                        false,
+                        slippageBPS
+                    );
+                    diagnostics.checks[3].status = 'passed';
+                    diagnostics.checks[3].contractResponse = {
+                        router: swapData.router,
+                        routerType: swapData.routerType === 0 ? 'V2' : 'V3',
+                        amountIn: swapData.amountIn.toString(),
+                        amountOutMin: swapData.amountOutMin.toString(),
+                        path: swapData.path,
+                        v3Fees: swapData.v3Fees.map(f => f.toString())
+                    };
+                    diagnostics.success = true;
+                    currentQuote = swapData;
+                } catch (contractError) {
+                    diagnostics.checks[3].status = 'failed';
+                    diagnostics.checks[3].contractError = {
+                        message: contractError.message,
+                        code: contractError.code,
+                        reason: contractError.reason,
+                        data: contractError.data
+                    };
+
+                    // Analyze why contract failed
+                    if (contractError.message.includes('No valid router found')) {
+                        diagnostics.checks[3].analysis = 'Contract could not find valid route - all V2/V3 paths failed';
+                    } else if (contractError.message.includes('No valid route found')) {
+                        diagnostics.checks[3].analysis = 'Contract getBestRouterWithPath returned address(0)';
+                    } else if (contractError.message.includes('revert')) {
+                        diagnostics.checks[3].analysis = 'Contract reverted - likely internal calculation failure';
+                    } else {
+                        diagnostics.checks[3].analysis = 'Unknown contract error';
+                    }
+
+                    // Check if V3 pools exist but contract failed to use them
+                    const validV3Pools = v3DebugResults.filter(r => r.hasLiquidity && r.hasPriceData);
+                    if (validV3Pools.length > 0) {
+                        diagnostics.checks[3].v3PoolMismatch = {
+                            message: 'Valid V3 pools found but contract did not select them',
+                            validPools: validV3Pools.length,
+                            possibleReasons: [
+                                '_calculateV3SwapOutput may be returning 0 or max impact',
+                                '_getBestV3Pool may be filtering out all pools',
+                                'V2 quote may be failing too, causing both to return address(0)',
+                                'Pool validation checks may be too strict'
+                            ]
+                        };
+                    }
+
+                    throw contractError;
+                }
 
                 currentQuote = swapData;
 
@@ -1560,6 +1680,78 @@
                         diagHtml += '</li>';
                     });
                     diagHtml += '</ul></div>';
+                }
+
+                // V3 Debug Results
+                if (diagnostics.v3DebugResults && diagnostics.v3DebugResults.length > 0) {
+                    diagHtml += '<div style="margin-top: 15px; padding: 10px; background: #e3f2fd; border-radius: 5px;">';
+                    diagHtml += '<strong>🔍 V3 Pool Deep Diagnostics:</strong><ul style="margin: 5px 0; padding-left: 20px;">';
+                    diagnostics.v3DebugResults.forEach(result => {
+                        diagHtml += `<li>Router: ${result.router.slice(0, 10)}..., Fee Tier: ${result.fee / 10000}%<br>`;
+                        diagHtml += `Pool: ${result.pool ? result.pool.slice(0, 10) + '...' : 'N/A'}<br>`;
+                        if (result.liquidity) {
+                            diagHtml += `Liquidity: ${result.liquidity} ${result.hasLiquidity ? '✓' : '✗ ZERO'}<br>`;
+                            diagHtml += `SqrtPriceX96: ${result.sqrtPriceX96} ${result.hasPriceData ? '✓' : '✗ ZERO'}<br>`;
+                            diagHtml += `Tick: ${result.tick}, Unlocked: ${result.unlocked ? 'Yes' : 'No'}<br>`;
+                            diagHtml += `Direction: ${result.zeroForOne ? 'Token0→Token1' : 'Token1→Token0'}<br>`;
+                            diagHtml += `Token0: ${result.token0}<br>`;
+                            diagHtml += `Token1: ${result.token1}<br>`;
+                            
+                            if (!result.hasLiquidity) {
+                                diagHtml += `<span style="color: #c62828; font-weight: bold;">⚠ Pool has NO liquidity!</span><br>`;
+                            }
+                            if (!result.hasPriceData) {
+                                diagHtml += `<span style="color: #c62828; font-weight: bold;">⚠ Pool has NO price data (sqrtPrice=0)!</span><br>`;
+                            }
+                        }
+                        if (result.error) {
+                            diagHtml += `<span style="color: #c62828;">Error: ${result.error}</span><br>`;
+                        }
+                        diagHtml += `Status: <strong>${result.status}</strong></li><br>`;
+                    });
+                    diagHtml += '</ul></div>';
+                }
+
+                // Contract call analysis
+                if (diagnostics.checks[3]) {
+                    diagHtml += '<div style="margin-top: 15px; padding: 10px; background: #fff3cd; border-radius: 5px;">';
+                    diagHtml += '<strong>📋 Contract getBestSwapData Analysis:</strong><br>';
+                    
+                    if (diagnostics.checks[3].contractError) {
+                        diagHtml += `<span style="color: #c62828; font-weight: bold;">Error: ${diagnostics.checks[3].contractError.message}</span><br>`;
+                        if (diagnostics.checks[3].contractError.reason) {
+                            diagHtml += `Reason: ${diagnostics.checks[3].contractError.reason}<br>`;
+                        }
+                        if (diagnostics.checks[3].analysis) {
+                            diagHtml += `Analysis: ${diagnostics.checks[3].analysis}<br>`;
+                        }
+                    }
+
+                    if (diagnostics.checks[3].v3PoolMismatch) {
+                        diagHtml += '<div style="margin-top: 10px; padding: 8px; background: #ffebee; border-left: 4px solid #c62828;">';
+                        diagHtml += `<strong style="color: #c62828;">⚠ V3 Pool Mismatch Detected!</strong><br>`;
+                        diagHtml += `${diagnostics.checks[3].v3PoolMismatch.message}<br>`;
+                        diagHtml += `Valid V3 Pools Found: ${diagnostics.checks[3].v3PoolMismatch.validPools}<br>`;
+                        diagHtml += '<strong>Possible Reasons:</strong><ul style="margin: 5px 0; padding-left: 20px;">';
+                        diagnostics.checks[3].v3PoolMismatch.possibleReasons.forEach(reason => {
+                            diagHtml += `<li>${reason}</li>`;
+                        });
+                        diagHtml += '</ul></div>';
+                    }
+
+                    if (diagnostics.checks[3].contractResponse) {
+                        diagHtml += `<div style="margin-top: 10px; padding: 8px; background: #e8f5e9; border-left: 4px solid #2e7d32;">`;
+                        diagHtml += `<strong style="color: #2e7d32;">✓ Contract Response:</strong><br>`;
+                        diagHtml += `Router: ${diagnostics.checks[3].contractResponse.router}<br>`;
+                        diagHtml += `Type: ${diagnostics.checks[3].contractResponse.routerType}<br>`;
+                        diagHtml += `Amount Out Min: ${diagnostics.checks[3].contractResponse.amountOutMin}<br>`;
+                        if (diagnostics.checks[3].contractResponse.v3Fees.length > 0) {
+                            diagHtml += `V3 Fees: ${diagnostics.checks[3].contractResponse.v3Fees.join(', ')}<br>`;
+                        }
+                        diagHtml += `</div>`;
+                    }
+
+                    diagHtml += '</div>';
                 }
 
                 diagHtml += '<div style="margin-top: 15px; padding: 10px; background: #fff3cd; border-radius: 5px;">';
