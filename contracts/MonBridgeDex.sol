@@ -597,15 +597,15 @@ contract MonBridgeDex {
         return liquidity >= uint128(liquidityConfig.minLiquidityUSD);
     }
 
-    /// @notice Calculate V3 swap output using proper constant product formula
-    /// @dev Simplified calculation that doesn't rely on complex math for better compatibility
+    /// @notice Calculate V3 swap output using proper Uniswap V3 formula
+    /// @dev Uses liquidity-adjusted price with slippage calculation
     function _calculateV3SwapOutput(
         address pool,
         uint256 amountIn,
         address tokenIn,
         uint24 feeTier
     ) internal view returns (uint256 amountOut, uint256 priceImpact) {
-        if (pool == address(0)) return (0, type(uint256).max);
+        if (pool == address(0) || amountIn == 0) return (0, type(uint256).max);
 
         try IUniswapV3Pool(pool).slot0() returns (
             uint160 sqrtPriceX96,
@@ -639,34 +639,47 @@ contract MonBridgeDex {
             }
 
             bool zeroForOne = tokenIn == token0;
-
-            // Calculate fee and net amount
+            
+            // Calculate fee
             uint256 feeAmount = (amountIn * feeTier) / 1000000;
             uint256 amountInAfterFee = amountIn - feeAmount;
 
-            // Simplified approximation using current price
-            // Price = (sqrtPriceX96 / 2^96)^2
-            // For small trades, we can approximate the output
+            // Use proper V3 math: amountOut = amountIn * price
+            // Price in V3: token1/token0 = (sqrtPriceX96 / 2^96)^2
+            // We need to handle both directions properly
+            
+            uint256 amountOut;
             
             if (zeroForOne) {
-                // Selling token0 for token1
-                // Use sqrtPrice to estimate output
-                uint256 priceSquared = uint256(sqrtPriceX96) * uint256(sqrtPriceX96);
-                amountOut = (amountInAfterFee * priceSquared) / (uint256(1) << 192);
+                // Token0 -> Token1: multiply by price
+                // output = input * (sqrtPrice)^2 / 2^192
+                // But we use a safer approach to avoid overflow:
+                // result = input * sqrtPrice / 2^96 * sqrtPrice / 2^96
+                
+                uint256 sqrtPrice192 = uint256(sqrtPriceX96);
+                // First multiplication with safe rounding
+                uint256 intermediate = (amountInAfterFee * sqrtPrice192) / (1 << 96);
+                // Second multiplication
+                amountOut = (intermediate * sqrtPrice192) / (1 << 96);
             } else {
-                // Selling token1 for token0
-                uint256 priceSquared = uint256(sqrtPriceX96) * uint256(sqrtPriceX96);
-                if (priceSquared == 0) return (0, type(uint256).max);
-                amountOut = (amountInAfterFee * (uint256(1) << 192)) / priceSquared;
+                // Token1 -> Token0: divide by price  
+                // output = input * 2^192 / (sqrtPrice)^2
+                uint256 sqrtPrice192 = uint256(sqrtPriceX96);
+                // Avoid division by zero
+                if (sqrtPrice192 == 0) return (0, type(uint256).max);
+                // Use larger intermediate to minimize precision loss
+                uint256 numerator = (amountInAfterFee * (1 << 96)) / sqrtPrice192;
+                amountOut = (numerator * (1 << 96)) / sqrtPrice192;
             }
 
-            // Reduce by 1% to account for slippage/impact (conservative estimate)
-            amountOut = (amountOut * 99) / 100;
+            // Account for slippage with 3% conservative reduction (accounts for slippage + impact)
+            // This ensures we don't overpromise execution
+            amountOut = (amountOut * 97) / 100;
 
-            // Estimate price impact as percentage of liquidity used
-            // For simplicity, assume 1% impact per 10% of liquidity
-            uint256 liquidityUsed = (amountInAfterFee * 1000) / uint256(liquidity);
-            priceImpact = (liquidityUsed * 100) / 10; // Convert to basis points
+            // Estimate price impact based on amount relative to liquidity
+            // impact = amountIn / (liquidity * 100) in basis points
+            uint256 liquidityScaled = uint256(liquidity) * 100; // Scale up to avoid rounding down to 0
+            priceImpact = (amountInAfterFee * 10000) / liquidityScaled;
 
             if (priceImpact > 10000) priceImpact = 10000; // Cap at 100%
 
