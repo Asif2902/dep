@@ -76,6 +76,8 @@ interface IUniswapV3Pool {
     function token0() external view returns (address);
     function token1() external view returns (address);
     function fee() external view returns (uint24);
+    function observe(uint32[] calldata secondsAgos) external view returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
+    function tickSpacing() external view returns (int24);
 }
 
 interface ISwapRouter {
@@ -573,20 +575,89 @@ contract MonBridgeDex {
         return 0;
     }
 
-    /// @notice Validate pool price against TWAP to prevent manipulation
-    function _validateTWAP(address pool, uint160 currentPrice) internal view returns (bool) {
+    /// @notice Validate pool price against TWAP to prevent flash loan manipulation
+    /// @dev Compares current spot price with TWAP over configured interval
+    /// @param pool The V3 pool address to validate
+    /// @param currentSqrtPriceX96 Current sqrt price from slot0
+    /// @return isValid True if price deviation is within acceptable range
+    function _validateTWAP(address pool, uint160 currentSqrtPriceX96) internal view returns (bool) {
         if (!twapConfig.enableTWAPCheck) return true;
+        if (pool == address(0) || currentSqrtPriceX96 == 0) return false;
 
-        // This is a simplified TWAP check
-        // In production, you would implement proper TWAP calculation using observations
-        // For now, we return true to not block swaps
-        // TODO: Implement full TWAP oracle with historical price checks
+        // Query TWAP from V3 pool observations
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = twapConfig.twapInterval; // e.g., 300 seconds ago
+        secondsAgos[1] = 0; // now
 
-        // Suppress unused parameter warnings
-        pool;
-        currentPrice;
+        try IUniswapV3Pool(pool).observe(secondsAgos) returns (
+            int56[] memory tickCumulatives,
+            uint160[] memory
+        ) {
+            // Calculate average tick over the interval with proper rounding
+            int56 tickDiff = tickCumulatives[1] - tickCumulatives[0];
+            int56 interval = int56(uint56(twapConfig.twapInterval));
+            
+            // Proper rounding for negative tick differences (round towards negative infinity)
+            int24 avgTick;
+            if (tickDiff < 0 && (tickDiff % interval != 0)) {
+                avgTick = int24((tickDiff / interval) - 1);
+            } else {
+                avgTick = int24(tickDiff / interval);
+            }
+            
+            // Get current tick from slot0
+            int24 currentTick;
+            try IUniswapV3Pool(pool).slot0() returns (
+                uint160,
+                int24 tick,
+                uint16,
+                uint16,
+                uint16,
+                uint8,
+                bool
+            ) {
+                currentTick = tick;
+            } catch {
+                return false;
+            }
 
-        return true;
+            // Calculate tick deviation as a proxy for price deviation
+            // Each tick represents ~0.01% price change
+            int24 tickDeviation = currentTick > avgTick ? currentTick - avgTick : avgTick - currentTick;
+            
+            // Convert maxPriceDeviationBPS to tick deviation
+            // 1 BPS = 0.01%, 1 tick = ~0.01% price change
+            // So maxPriceDeviationBPS maps roughly to max tick deviation
+            int24 maxTickDeviation = int24(uint24(twapConfig.maxPriceDeviationBPS));
+            
+            return tickDeviation <= maxTickDeviation;
+        } catch {
+            // If TWAP query fails (insufficient observations), allow swap but log warning
+            // This prevents blocking swaps on new pools
+            return true;
+        }
+    }
+
+    /// @notice Get TWAP price for a V3 pool with proper rounding
+    /// @param pool The V3 pool address
+    /// @param twapInterval Time interval in seconds for TWAP calculation
+    /// @return twapTick The time-weighted average tick (properly rounded)
+    function _getTWAPTick(address pool, uint32 twapInterval) internal view returns (int24 twapTick) {
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = twapInterval;
+        secondsAgos[1] = 0;
+
+        (int56[] memory tickCumulatives, ) = IUniswapV3Pool(pool).observe(secondsAgos);
+        int56 tickDiff = tickCumulatives[1] - tickCumulatives[0];
+        int56 interval = int56(uint56(twapInterval));
+        
+        // Proper rounding for negative tick differences (round towards negative infinity)
+        // This matches Uniswap's OracleLibrary implementation
+        if (tickDiff < 0 && (tickDiff % interval != 0)) {
+            twapTick = int24((tickDiff / interval) - 1);
+        } else {
+            twapTick = int24(tickDiff / interval);
+        }
     }
 
     /// @notice Validate pool liquidity meets minimum requirements
@@ -597,8 +668,14 @@ contract MonBridgeDex {
         return liquidity >= uint128(liquidityConfig.minLiquidityUSD);
     }
 
-    /// @notice Calculate V3 swap output with decimal-aware pricing
-    /// @dev Simplified approach that handles token decimal differences properly
+    /// @notice Calculate V3 swap output with accurate liquidity-based price impact
+    /// @dev Uses actual liquidity to calculate real price impact from swap
+    /// @param pool V3 pool address
+    /// @param amountIn Input amount
+    /// @param tokenIn Input token address
+    /// @param feeTier Pool fee tier (e.g., 500, 3000, 10000)
+    /// @return amountOut Expected output amount after the swap
+    /// @return priceImpact Price impact in basis points (100 = 1%)
     function _calculateV3SwapOutput(
         address pool,
         uint256 amountIn,
@@ -625,6 +702,11 @@ contract MonBridgeDex {
 
             if (liquidity == 0 || sqrtPriceX96 == 0) return (0, type(uint256).max);
 
+            // Validate TWAP if enabled (flash loan protection)
+            if (!_validateTWAP(pool, sqrtPriceX96)) {
+                return (0, type(uint256).max);
+            }
+
             address token0;
             address token1;
             
@@ -646,49 +728,56 @@ contract MonBridgeDex {
             uint256 feeAmount = (amountIn * feeTier) / 1000000;
             uint256 amountInAfterFee = amountIn - feeAmount;
 
-            // Simplified V3 price calculation WITHOUT squaring to avoid overflow
-            // sqrtPriceX96 = sqrt(price) * 2^96 where price = token1/token0
-            // Use two-step mulDiv to get price without overflow
-            // V3 price already accounts for decimal differences - no extra adjustment needed!
-            
-            uint256 amountOut;
-            
+            // Calculate output at SPOT PRICE (no slippage - ideal output)
+            uint256 spotOutput;
             if (zeroForOne) {
-                // Token0 -> Token1: amountOut = amountIn * (sqrtPrice / 2^96)^2
-                // Step 1: intermediate = amountIn * sqrtPrice / 2^96
-                // Step 2: amountOut = intermediate * sqrtPrice / 2^96
                 uint256 intermediate = FullMath.mulDiv(amountInAfterFee, uint256(sqrtPriceX96), FixedPoint96.Q96);
-                amountOut = FullMath.mulDiv(intermediate, uint256(sqrtPriceX96), FixedPoint96.Q96);
+                spotOutput = FullMath.mulDiv(intermediate, uint256(sqrtPriceX96), FixedPoint96.Q96);
             } else {
-                // Token1 -> Token0: amountOut = amountIn / (sqrtPrice / 2^96)^2
-                // Step 1: intermediate = amountIn * 2^96 / sqrtPrice
-                // Step 2: amountOut = intermediate * 2^96 / sqrtPrice
                 if (sqrtPriceX96 == 0) return (0, type(uint256).max);
                 uint256 intermediate = FullMath.mulDiv(amountInAfterFee, FixedPoint96.Q96, uint256(sqrtPriceX96));
-                amountOut = FullMath.mulDiv(intermediate, FixedPoint96.Q96, uint256(sqrtPriceX96));
+                spotOutput = FullMath.mulDiv(intermediate, FixedPoint96.Q96, uint256(sqrtPriceX96));
             }
 
-            // Apply conservative slippage reduction based on base slippage config
-            uint256 slippageReduction = 10000 - slippageConfig.baseSlippageBPS;
-            amountOut = (amountOut * slippageReduction) / 10000;
+            // ACCURATE PRICE IMPACT CALCULATION using V3 concentrated liquidity model
+            // Price impact in V3 is determined by how much the trade moves sqrt(price)
+            // For a swap of deltaX in token0, new sqrt(P') = L / (L/sqrt(P) + deltaX)
+            // Price impact = (P - P') / P = relative change in price
+            
+            // Calculate the virtual reserves based on liquidity and current price
+            // Virtual reserve0 = L / sqrtPrice, Virtual reserve1 = L * sqrtPrice
+            uint256 virtualReserve0 = FullMath.mulDiv(uint256(liquidity), FixedPoint96.Q96, uint256(sqrtPriceX96));
+            uint256 virtualReserve1 = FullMath.mulDiv(uint256(liquidity), uint256(sqrtPriceX96), FixedPoint96.Q96);
+            
+            // Calculate actual output considering liquidity depth
+            // Using constant product approximation for concentrated liquidity:
+            // actualOut = (amountIn * reserveOut) / (reserveIn + amountIn)
+            if (zeroForOne) {
+                // Swapping token0 for token1
+                if (virtualReserve0 + amountInAfterFee == 0) return (0, type(uint256).max);
+                amountOut = FullMath.mulDiv(amountInAfterFee, virtualReserve1, virtualReserve0 + amountInAfterFee);
+            } else {
+                // Swapping token1 for token0
+                if (virtualReserve1 + amountInAfterFee == 0) return (0, type(uint256).max);
+                amountOut = FullMath.mulDiv(amountInAfterFee, virtualReserve0, virtualReserve1 + amountInAfterFee);
+            }
 
             // Validate we got a reasonable output
-            if (amountOut == 0) {
-                // Return error - pool calculation failed
+            if (amountOut == 0 || spotOutput == 0) {
                 return (0, type(uint256).max);
             }
 
-            // Use user's suggestion: input-based price impact calculation
-            // Simple heuristic: larger trades = higher impact
-            // impact = sqrt(amountIn) / 1000 in basis points, minimum is fee tier
+            // Calculate REAL price impact: (spotOutput - actualOutput) / spotOutput * 10000
+            // This gives us basis points of slippage due to trade size vs liquidity
+            if (spotOutput > amountOut) {
+                priceImpact = ((spotOutput - amountOut) * 10000) / spotOutput;
+            } else {
+                priceImpact = 0;
+            }
+
+            // Add fee tier contribution to price impact for routing decisions
             uint256 feeTierBPS = (uint256(feeTier) * 10000) / 1000000;
-            
-            // Start with fee tier as base impact, add small percentage of input
-            // This keeps impact reasonable while scaling with trade size
-            priceImpact = feeTierBPS + ((amountIn / amountInAfterFee) * 10); // Add ~1% per trade size
-            
-            // Cap at reasonable maximum (10% = 1000 BPS)
-            if (priceImpact > 1000) priceImpact = 1000;
+            priceImpact += feeTierBPS;
 
             return (amountOut, priceImpact);
         } catch {
@@ -806,6 +895,110 @@ contract MonBridgeDex {
         return true;
     }
 
+    /// @notice Calculate accurate V2 price impact using constant product AMM formula
+    /// @dev Compares ideal output (spot price) with actual output from AMM
+    /// @param router V2 router address
+    /// @param path Token path for the swap
+    /// @param amountIn Input amount
+    /// @return actualOutput The actual output amount after swap
+    /// @return priceImpact Price impact in basis points (100 = 1%)
+    function _calculateV2SwapOutput(
+        address router,
+        address[] memory path,
+        uint256 amountIn
+    ) internal view returns (uint256 actualOutput, uint256 priceImpact) {
+        if (path.length < 2 || amountIn == 0) return (0, type(uint256).max);
+
+        try IUniswapV2Router02(router).factory() returns (address factory) {
+            if (factory == address(0)) return (0, type(uint256).max);
+
+            // Get actual output from router
+            uint[] memory amounts;
+            try IUniswapV2Router02(router).getAmountsOut(amountIn, path) returns (uint[] memory res) {
+                amounts = res;
+                actualOutput = amounts[amounts.length - 1];
+            } catch {
+                return (0, type(uint256).max);
+            }
+
+            if (actualOutput == 0) return (0, type(uint256).max);
+
+            // Calculate cumulative price impact across all hops
+            uint256 cumulativeIdealOutput = amountIn;
+            uint256 cumulativeActualOutput = amountIn;
+
+            for (uint i = 0; i < path.length - 1; i++) {
+                address tokenIn = path[i];
+                address tokenOut = path[i + 1];
+
+                // Get pair address
+                address pair;
+                try IUniswapV2Factory(factory).getPair(tokenIn, tokenOut) returns (address p) {
+                    pair = p;
+                } catch {
+                    return (actualOutput, 0); // Fall back to no impact if pair query fails
+                }
+
+                if (pair == address(0)) return (actualOutput, 0);
+
+                // Get reserves
+                uint112 reserve0;
+                uint112 reserve1;
+                try IUniswapV2Pair(pair).getReserves() returns (uint112 r0, uint112 r1, uint32) {
+                    reserve0 = r0;
+                    reserve1 = r1;
+                } catch {
+                    return (actualOutput, 0);
+                }
+
+                // Determine which reserve is for which token
+                address token0;
+                try IUniswapV2Pair(pair).token0() returns (address t0) {
+                    token0 = t0;
+                } catch {
+                    return (actualOutput, 0);
+                }
+
+                uint256 reserveIn;
+                uint256 reserveOut;
+                if (tokenIn == token0) {
+                    reserveIn = uint256(reserve0);
+                    reserveOut = uint256(reserve1);
+                } else {
+                    reserveIn = uint256(reserve1);
+                    reserveOut = uint256(reserve0);
+                }
+
+                if (reserveIn == 0 || reserveOut == 0) return (actualOutput, 0);
+
+                // Calculate ideal output at spot price (no slippage)
+                // Ideal: amountOut = (amountIn * reserveOut) / reserveIn
+                uint256 hopIdeal = (cumulativeActualOutput * reserveOut) / reserveIn;
+                
+                // Actual output uses AMM formula with 0.3% fee:
+                // amountOut = (amountIn * 997 * reserveOut) / (reserveIn * 1000 + amountIn * 997)
+                uint256 amountInWithFee = cumulativeActualOutput * 997;
+                uint256 numerator = amountInWithFee * reserveOut;
+                uint256 denominator = reserveIn * 1000 + amountInWithFee;
+                uint256 hopActual = numerator / denominator;
+
+                cumulativeIdealOutput = hopIdeal;
+                cumulativeActualOutput = hopActual;
+            }
+
+            // Calculate price impact: (idealOutput - actualOutput) / idealOutput * 10000
+            if (cumulativeIdealOutput > cumulativeActualOutput && cumulativeIdealOutput > 0) {
+                priceImpact = ((cumulativeIdealOutput - cumulativeActualOutput) * 10000) / cumulativeIdealOutput;
+            } else {
+                priceImpact = 0;
+            }
+
+            return (actualOutput, priceImpact);
+        } catch {
+            return (0, type(uint256).max);
+        }
+    }
+
     /// @notice Check if V3 pool exists and has liquidity
     /// @dev Only checks pool existence and liquidity, avoiding strict checks that could exclude valid pools
     function _v3PoolExists(address factory, address tokenA, address tokenB, uint24 fee) internal view returns (bool) {
@@ -835,7 +1028,8 @@ contract MonBridgeDex {
         }
     }
 
-    /// @notice Find best router (V2 or V3) with highest output
+    /// @notice Find best router (V2 or V3) with highest output and lowest price impact
+    /// @dev Uses accurate price impact calculations for both V2 and V3
     function _getBestRouter(uint amountIn, address[] memory path) internal view returns (
         address bestRouter,
         uint bestAmountOut,
@@ -857,20 +1051,14 @@ contract MonBridgeDex {
 
             // Try direct path first - validate pair exists
             if (_validateV2Path(routersV2[i], path)) {
-                uint[] memory amounts;
-                try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
-                    amounts = res;
-                    uint amountOut = amounts[amounts.length - 1];
-
-                    if (amountOut > 0 && amountOut > bestAmountOut) {
-                        bestAmountOut = amountOut;
-                        bestRouter = routersV2[i];
-                        bestRouterType = RouterType.V2;
-                        bestPriceImpact = 0;
-                        bestPath = path;
-                    }
-                } catch {
-                    // Skip this router if getAmountsOut fails
+                (uint256 amountOut, uint256 impact) = _calculateV2SwapOutput(routersV2[i], path, amountIn);
+                
+                if (amountOut > 0 && amountOut > bestAmountOut) {
+                    bestAmountOut = amountOut;
+                    bestRouter = routersV2[i];
+                    bestRouterType = RouterType.V2;
+                    bestPriceImpact = impact;
+                    bestPath = path;
                 }
             }
 
@@ -883,21 +1071,15 @@ contract MonBridgeDex {
 
                 // Validate WETH path exists
                 if (_validateV2Path(routersV2[i], wethPath)) {
-                    uint[] memory wethAmounts;
-                    try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
-                        wethAmounts = res;
-                        uint wethAmountOut = wethAmounts[wethAmounts.length - 1];
+                    (uint256 wethAmountOut, uint256 wethImpact) = _calculateV2SwapOutput(routersV2[i], wethPath, amountIn);
 
-                        // If routing through WETH gives better price, use it
-                        if (wethAmountOut > 0 && wethAmountOut > bestAmountOut) {
-                            bestAmountOut = wethAmountOut;
-                            bestRouter = routersV2[i];
-                            bestRouterType = RouterType.V2;
-                            bestPriceImpact = 0;
-                            bestPath = wethPath;
-                        }
-                    } catch {
-                        // Skip this path if getAmountsOut fails
+                    // If routing through WETH gives better price, use it
+                    if (wethAmountOut > 0 && wethAmountOut > bestAmountOut) {
+                        bestAmountOut = wethAmountOut;
+                        bestRouter = routersV2[i];
+                        bestRouterType = RouterType.V2;
+                        bestPriceImpact = wethImpact;
+                        bestPath = wethPath;
                     }
                 }
             }
@@ -969,8 +1151,9 @@ contract MonBridgeDex {
 
     /// @notice Calculate optimal split percentages across multiple routers
     /// @dev Uses greedy algorithm to find best distribution minimizing total impact
+    /// @dev IMPORTANT: This function expects amountForSwap (post-fee amount) - fee is already deducted by caller
     function _calculateOptimalSplits(
-        uint totalAmountIn,
+        uint amountForSwap,
         address[] memory path,
         uint8 maxSplitsAllowed
     ) internal view returns (
@@ -978,9 +1161,8 @@ contract MonBridgeDex {
         uint16[] memory percentages,
         uint totalExpectedOut
     ) {
-        uint fee = totalAmountIn / FEE_DIVISOR;
-        uint amountForSwap = totalAmountIn - fee;
-        RouterQuote[] memory allQuotes = _getAllRouterQuotes(amountForSwap / 4, path); // Test with 25% chunks after fee
+        // NOTE: Fee is already deducted by caller, do NOT deduct again
+        RouterQuote[] memory allQuotes = _getAllRouterQuotes(amountForSwap / 4, path); // Test with 25% chunks
 
         if (allQuotes.length == 0) {
             return (new RouterQuote[](0), new uint16[](0), 0);
@@ -1003,7 +1185,8 @@ contract MonBridgeDex {
         }
 
         // Calculate optimal distribution using iterative refinement
-        totalExpectedOut = _optimizeSplitPercentages(selectedQuotes, percentages, totalAmountIn, path);
+        // Use amountForSwap (post-fee) for output calculations
+        totalExpectedOut = _optimizeSplitPercentages(selectedQuotes, percentages, amountForSwap, path);
     }
 
     /// @notice Sort quotes by output amount (descending)
@@ -1161,8 +1344,9 @@ contract MonBridgeDex {
         minAmountOut = (amountOut * (10000 - slippageBPS)) / 10000;
     }
 
-    /// @notice Get the best swap data with adaptive slippage and optimal routing
+    /// @notice Get the best swap data with adaptive slippage, optimal routing, and automatic split detection
     /// @dev GUARANTEED to return valid swap data - tries V2 and V3, returns best available
+    /// @dev Automatically suggests splitting if price impact exceeds threshold (use getBestSwapDataWithSplits for split data)
     function getBestSwapData(
         uint amountIn,
         address[] calldata path,
@@ -1250,8 +1434,9 @@ contract MonBridgeDex {
         SwapData[] memory splits = new SwapData[](quotes.length);
 
         for (uint i = 0; i < quotes.length; i++) {
-            uint splitAmount = (amountForSwap * percentages[i]) / 10000;
-            uint splitAmountWithFee = (amountIn * percentages[i]) / 10000;
+            // Use GROSS amount for execution - execute() will deduct fees
+            // The quote comparison uses post-fee, but execution needs gross
+            uint splitAmountGross = (amountIn * percentages[i]) / 10000;
 
             // Determine swap type
             SwapType swapType;
@@ -1284,7 +1469,7 @@ contract MonBridgeDex {
                 router: quotes[i].router,
                 path: quotes[i].path,
                 v3Fees: v3Fees,
-                amountIn: splitAmountWithFee,
+                amountIn: splitAmountGross, // Gross amount - execute() deducts fees
                 amountOutMin: splitMinOut,
                 deadline: block.timestamp + 300,
                 supportFeeOnTransfer: supportFeeOnTransfer
@@ -1295,10 +1480,168 @@ contract MonBridgeDex {
 
         splitData = SplitSwapData({
             splits: splits,
-            totalAmountIn: amountIn,
+            totalAmountIn: amountIn, // Gross total for execution
             totalAmountOutMin: totalMinOut,
             splitPercentages: percentages
         });
+    }
+
+    /// @notice Comprehensive swap data function that automatically handles single, multi-hop, and split strategies
+    /// @dev This is the recommended entry point - automatically chooses optimal strategy based on price impact
+    /// @param amountIn Input amount
+    /// @param path Token path for the swap
+    /// @param supportFeeOnTransfer Whether to support fee-on-transfer tokens
+    /// @param userSlippageBPS User-specified slippage (0 for auto)
+    /// @return useSplit Whether split swap is recommended (true) or single swap (false)
+    /// @return singleSwapData Single swap data (valid if useSplit is false)
+    /// @return splitSwapData Split swap data (valid if useSplit is true)
+    /// @return estimatedOutput Best estimated output amount
+    /// @return totalPriceImpact Combined price impact in basis points
+    function getBestSwapDataWithSplits(
+        uint amountIn,
+        address[] calldata path,
+        bool supportFeeOnTransfer,
+        uint16 userSlippageBPS
+    )
+        external
+        view
+        returns (
+            bool useSplit,
+            SwapData memory singleSwapData,
+            SplitSwapData memory splitSwapData,
+            uint estimatedOutput,
+            uint totalPriceImpact
+        )
+    {
+        require(path.length >= 2, "MonBridgeDex: Invalid path");
+        require(amountIn > 0, "MonBridgeDex: Amount must be > 0");
+
+        uint fee = amountIn / FEE_DIVISOR;
+        uint amountForSwap = amountIn - fee;
+
+        // Step 1: Get best single route with price impact
+        (address bestRouter, uint singleOutput, RouterType routerType, uint24[] memory v3Fees, uint singleImpact, address[] memory optimalPath) =
+            _getBestRouterWithPath(amountForSwap, path);
+
+        // Step 2: Check if splitting would give better results (if enabled)
+        uint splitOutput = 0;
+        uint splitImpact = type(uint).max;
+        bool splitAvailable = false;
+
+        if (splitConfig.enableAutoSplit && singleImpact >= splitConfig.minSplitImpactBPS) {
+            // Try to calculate split strategy
+            (RouterQuote[] memory quotes, uint16[] memory percentages, uint totalExpectedOut) =
+                _calculateOptimalSplits(amountForSwap, path, splitConfig.maxSplits);
+
+            if (quotes.length >= 2 && totalExpectedOut > 0) {
+                splitOutput = totalExpectedOut;
+                splitAvailable = true;
+                
+                // Calculate weighted average price impact for splits
+                uint weightedImpact = 0;
+                for (uint i = 0; i < quotes.length; i++) {
+                    weightedImpact += quotes[i].priceImpact * percentages[i];
+                }
+                splitImpact = weightedImpact / 10000;
+            }
+        }
+
+        // Step 3: Decide whether to use single or split
+        // Use split if: split is available AND (split output > single output OR split impact < single impact)
+        useSplit = splitAvailable && (splitOutput > singleOutput || (splitOutput >= singleOutput * 99 / 100 && splitImpact < singleImpact));
+
+        if (useSplit) {
+            // Build split swap data
+            (RouterQuote[] memory quotes, uint16[] memory percentages, ) =
+                _calculateOptimalSplits(amountForSwap, path, splitConfig.maxSplits);
+
+            SwapData[] memory splits = new SwapData[](quotes.length);
+            for (uint i = 0; i < quotes.length; i++) {
+                // Use GROSS amount for execution - execute() will deduct fees
+                // The quote comparison uses post-fee, but execution needs gross
+                uint splitAmountGross = (amountIn * percentages[i]) / 10000;
+
+                SwapType swapType;
+                if (quotes[i].path[0] == WETH) {
+                    swapType = SwapType.ETH_TO_TOKEN;
+                } else if (quotes[i].path[quotes[i].path.length - 1] == WETH) {
+                    swapType = SwapType.TOKEN_TO_ETH;
+                } else {
+                    swapType = SwapType.TOKEN_TO_TOKEN;
+                }
+
+                uint24[] memory splitV3Fees;
+                if (quotes[i].routerType == RouterType.V3 && quotes[i].path.length > 2) {
+                    splitV3Fees = new uint24[](quotes[i].path.length - 1);
+                    for (uint j = 0; j < splitV3Fees.length; j++) {
+                        splitV3Fees[j] = quotes[i].v3Fee;
+                    }
+                } else {
+                    splitV3Fees = new uint24[](1);
+                    splitV3Fees[0] = quotes[i].v3Fee;
+                }
+
+                uint splitExpectedOut = (quotes[i].amountOut * percentages[i]) / 10000;
+                uint splitMinOut = _calculateAdaptiveSlippage(splitExpectedOut, quotes[i].priceImpact, userSlippageBPS);
+
+                splits[i] = SwapData({
+                    swapType: swapType,
+                    routerType: quotes[i].routerType,
+                    router: quotes[i].router,
+                    path: quotes[i].path,
+                    v3Fees: splitV3Fees,
+                    amountIn: splitAmountGross, // Gross amount - execute() deducts fees
+                    amountOutMin: splitMinOut,
+                    deadline: block.timestamp + 300,
+                    supportFeeOnTransfer: supportFeeOnTransfer
+                });
+            }
+
+            uint totalMinOut = _calculateAdaptiveSlippage(splitOutput, splitImpact, userSlippageBPS);
+            splitSwapData = SplitSwapData({
+                splits: splits,
+                totalAmountIn: amountIn, // Gross total for execution
+                totalAmountOutMin: totalMinOut,
+                splitPercentages: percentages
+            });
+
+            estimatedOutput = splitOutput;
+            totalPriceImpact = splitImpact;
+        } else {
+            // Build single swap data
+            require(bestRouter != address(0), "MonBridgeDex: No valid route found");
+
+            SwapType swapType;
+            if (optimalPath[0] == WETH) {
+                swapType = SwapType.ETH_TO_TOKEN;
+            } else if (optimalPath[optimalPath.length - 1] == WETH) {
+                swapType = SwapType.TOKEN_TO_ETH;
+            } else {
+                swapType = SwapType.TOKEN_TO_TOKEN;
+            }
+
+            if (routerType == RouterType.V2 || v3Fees.length == 0) {
+                v3Fees = new uint24[](1);
+                v3Fees[0] = 0;
+            }
+
+            uint amountOutMin = _calculateAdaptiveSlippage(singleOutput, singleImpact, userSlippageBPS);
+
+            singleSwapData = SwapData({
+                swapType: swapType,
+                routerType: routerType,
+                router: bestRouter,
+                path: optimalPath,
+                v3Fees: v3Fees,
+                amountIn: amountIn,
+                amountOutMin: amountOutMin,
+                deadline: block.timestamp + 300,
+                supportFeeOnTransfer: supportFeeOnTransfer
+            });
+
+            estimatedOutput = singleOutput;
+            totalPriceImpact = singleImpact;
+        }
     }
 
     /// @notice Get quotes from all available routers
@@ -1307,29 +1650,24 @@ contract MonBridgeDex {
         RouterQuote[] memory tempQuotes = new RouterQuote[](maxQuotes);
         uint quoteCount = 0;
 
-        // Get V2 quotes (direct path)
+        // Get V2 quotes (direct path) with accurate price impact
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
 
             // Try direct path - validate pair exists
             if (_validateV2Path(routersV2[i], path)) {
-                uint[] memory amounts;
-                try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
-                    amounts = res;
-                    
-                    if (amounts.length > 0 && amounts[amounts.length - 1] > 0) {
-                        tempQuotes[quoteCount] = RouterQuote({
-                            router: routersV2[i],
-                            routerType: RouterType.V2,
-                            v3Fee: 0,
-                            amountOut: amounts[amounts.length - 1],
-                            priceImpact: 0,
-                            path: path
-                        });
-                        quoteCount++;
-                    }
-                } catch {
-                    // Skip if quote fails
+                (uint256 amountOut, uint256 impact) = _calculateV2SwapOutput(routersV2[i], path, amountIn);
+                
+                if (amountOut > 0) {
+                    tempQuotes[quoteCount] = RouterQuote({
+                        router: routersV2[i],
+                        routerType: RouterType.V2,
+                        v3Fee: 0,
+                        amountOut: amountOut,
+                        priceImpact: impact,
+                        path: path
+                    });
+                    quoteCount++;
                 }
             }
 
@@ -1342,23 +1680,18 @@ contract MonBridgeDex {
 
                 // Validate WETH path exists
                 if (_validateV2Path(routersV2[i], wethPath)) {
-                    uint[] memory wethAmounts;
-                    try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
-                        wethAmounts = res;
+                    (uint256 wethAmountOut, uint256 wethImpact) = _calculateV2SwapOutput(routersV2[i], wethPath, amountIn);
 
-                        if (wethAmounts.length > 0 && wethAmounts[wethAmounts.length - 1] > 0) {
-                            tempQuotes[quoteCount] = RouterQuote({
-                                router: routersV2[i],
-                                routerType: RouterType.V2,
-                                v3Fee: 0,
-                                amountOut: wethAmounts[wethAmounts.length - 1],
-                                priceImpact: 0,
-                                path: wethPath
-                            });
-                            quoteCount++;
-                        }
-                    } catch {
-                        // Skip if quote fails
+                    if (wethAmountOut > 0) {
+                        tempQuotes[quoteCount] = RouterQuote({
+                            router: routersV2[i],
+                            routerType: RouterType.V2,
+                            v3Fee: 0,
+                            amountOut: wethAmountOut,
+                            priceImpact: wethImpact,
+                            path: wethPath
+                        });
+                        quoteCount++;
                     }
                 }
             }
@@ -1437,27 +1770,21 @@ contract MonBridgeDex {
         bool foundV2Route = false;
         bool foundV3Route = false;
 
-        // Check all V2 routers with direct and multi-hop paths
+        // Check all V2 routers with direct and multi-hop paths (with accurate price impact)
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
 
             // Try direct path - validate pair exists
             if (_validateV2Path(routersV2[i], path)) {
-                uint[] memory amounts;
-                try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
-                    amounts = res;
-                    uint amountOut = amounts[amounts.length - 1];
+                (uint256 amountOut, uint256 impact) = _calculateV2SwapOutput(routersV2[i], path, amountIn);
 
-                    if (amountOut > 0 && amountOut > bestAmountOut) {
-                        bestAmountOut = amountOut;
-                        bestRouter = routersV2[i];
-                        bestRouterType = RouterType.V2;
-                        bestPriceImpact = 0;
-                        bestPath = path;
-                        foundV2Route = true;
-                    }
-                } catch {
-                    // Skip this router if getAmountsOut fails
+                if (amountOut > 0 && amountOut > bestAmountOut) {
+                    bestAmountOut = amountOut;
+                    bestRouter = routersV2[i];
+                    bestRouterType = RouterType.V2;
+                    bestPriceImpact = impact;
+                    bestPath = path;
+                    foundV2Route = true;
                 }
             }
 
@@ -1470,22 +1797,16 @@ contract MonBridgeDex {
 
                 // Validate WETH path exists
                 if (_validateV2Path(routersV2[i], wethPath)) {
-                    uint[] memory wethAmounts;
-                    try IUniswapV2Router02(routersV2[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
-                        wethAmounts = res;
-                        uint wethAmountOut = wethAmounts[wethAmounts.length - 1];
+                    (uint256 wethAmountOut, uint256 wethImpact) = _calculateV2SwapOutput(routersV2[i], wethPath, amountIn);
 
-                        // If routing through WETH gives better price, use it
-                        if (wethAmountOut > 0 && wethAmountOut > bestAmountOut) {
-                            bestAmountOut = wethAmountOut;
-                            bestRouter = routersV2[i];
-                            bestRouterType = RouterType.V2;
-                            bestPriceImpact = 0;
-                            bestPath = wethPath;
-                            foundV2Route = true;
-                        }
-                    } catch {
-                        // Skip this path if getAmountsOut fails
+                    // If routing through WETH gives better price, use it
+                    if (wethAmountOut > 0 && wethAmountOut > bestAmountOut) {
+                        bestAmountOut = wethAmountOut;
+                        bestRouter = routersV2[i];
+                        bestRouterType = RouterType.V2;
+                        bestPriceImpact = wethImpact;
+                        bestPath = wethPath;
+                        foundV2Route = true;
                     }
                 }
             }
