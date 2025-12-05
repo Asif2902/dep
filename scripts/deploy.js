@@ -1,6 +1,14 @@
 const hre = require("hardhat");
 
 async function main() {
+  // Check if private key is available
+  const privateKey = process.env.DEPLOYER_PRIVATE_KEY;
+  if (!privateKey) {
+    console.log("❌ Error: DEPLOYER_PRIVATE_KEY not found in environment variables");
+    console.log("📝 Please set DEPLOYER_PRIVATE_KEY in Replit Secrets (Tools > Secrets)");
+    process.exit(1);
+  }
+
   console.log("🚀 Deploying MonBridgeDex to Monad...\n");
 
   // Get deployer account
@@ -14,11 +22,27 @@ async function main() {
   console.log("⏳ Deploying MonBridgeDex contract...");
   const MonBridgeDex = await hre.ethers.getContractFactory("MonBridgeDex");
   
-  // WETH address on Monad
-  const WETH_ADDRESS = "0x3bd359c1119da7da1d913d1c4d2b7c461115433a";
+  // Check compiled bytecode size
+  const bytecode = MonBridgeDex.bytecode;
+  const bytecodeSize = (bytecode.length - 2) / 2; // Remove '0x' and divide by 2
+  console.log("📊 Contract bytecode size:", bytecodeSize, "bytes");
+  console.log("📊 Size in KB:", (bytecodeSize / 1024).toFixed(2), "KB");
   
-  const monBridgeDex = await MonBridgeDex.deploy(WETH_ADDRESS);
+  if (bytecodeSize > 128 * 1024) {
+    console.log("❌ Error: Contract exceeds 128KB limit");
+    process.exit(1);
+  }
+  
+  // WETH and USDC addresses on Monad
+  const WETH_ADDRESS = "0x3bd359c1119da7da1d913d1c4d2b7c461115433a";
+  const USDC_ADDRESS = "0x754704Bc059F8C67012fEd69BC8A327a5aafb603"; // Set to actual USDC address or address(0) if not using
+  
+  console.log("🚀 Deploying with high gas limit to accommodate large contract...");
+  const monBridgeDex = await MonBridgeDex.deploy(WETH_ADDRESS, USDC_ADDRESS, {
+    gasLimit: 30000000 // Explicit high gas limit for large contract
+  });
 
+  console.log("⏳ Waiting for deployment confirmation...");
   await monBridgeDex.waitForDeployment();
   const contractAddress = await monBridgeDex.getAddress();
 
