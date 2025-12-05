@@ -1566,7 +1566,7 @@ contract MonBridgeDex {
                 );
 
                 if (pool1 != address(0) && amountMid > 0) {
-                    (address pool2, uint24 fee2, uint hopOut, uint impact2) = _getBestV3Pool(
+                    (address pool2, , uint hopOut, uint impact2) = _getBestV3Pool(
                         factory, intermediate, path[1], amountMid
                     );
 
@@ -1670,7 +1670,7 @@ contract MonBridgeDex {
         RouterQuote[] memory quotes,
         uint16[] memory percentages,
         uint totalAmount,
-        address[] memory path
+        address[] memory /* path */
     ) internal view returns (uint totalOut) {
         uint numSplits = quotes.length;
         if (numSplits == 0) return 0;
@@ -1728,11 +1728,11 @@ contract MonBridgeDex {
                         } catch {}
                     } else if (quotes[i].path.length == 3) {
                         // Multi-hop: get intermediate output then final
-                        (address pool1, uint24 fee1, uint amountMid, uint impact1) = _getBestV3Pool(
+                        (address pool1, , uint amountMid, uint impact1) = _getBestV3Pool(
                             factory, quotes[i].path[0], quotes[i].path[1], splitAmount
                         );
                         if (pool1 != address(0) && amountMid > 0) {
-                            (address pool2, uint24 fee2, uint hopOut, uint impact2) = _getBestV3Pool(
+                            (address pool2, , uint hopOut, uint impact2) = _getBestV3Pool(
                                 factory, quotes[i].path[1], quotes[i].path[2], amountMid
                             );
                             if (pool2 != address(0)) {
@@ -1814,11 +1814,11 @@ contract MonBridgeDex {
                         }
                     } catch {}
                 } else if (quotes[i].path.length == 3) {
-                    (address pool1, uint24 fee1, uint amountMid, ) = _getBestV3Pool(
+                    (address pool1, , uint amountMid, ) = _getBestV3Pool(
                         factory, quotes[i].path[0], quotes[i].path[1], splitAmount
                     );
                     if (pool1 != address(0) && amountMid > 0) {
-                        (address pool2, uint24 fee2, uint hopOut, ) = _getBestV3Pool(
+                        (address pool2, , uint hopOut, ) = _getBestV3Pool(
                             factory, quotes[i].path[1], quotes[i].path[2], amountMid
                         );
                         if (pool2 != address(0)) {
@@ -2291,7 +2291,7 @@ contract MonBridgeDex {
                     );
 
                     if (pool1 != address(0) && amountMid > 0) {
-                        (address pool2, uint24 fee2, uint hopOut, uint impact2) = _getBestV3Pool(
+                        (address pool2, , uint hopOut, uint impact2) = _getBestV3Pool(
                             factory, intermediate, path[1], amountMid
                         );
 
@@ -2371,7 +2371,7 @@ contract MonBridgeDex {
     /// @notice Get all available fee tier quotes for a single V3 router
     /// @dev Returns quotes for all fee tiers that have valid pools with liquidity
     function _getAllFeeTierQuotes(
-        address router,
+        address /* router */,
         address factory,
         address tokenIn,
         address tokenOut,
@@ -2425,15 +2425,13 @@ contract MonBridgeDex {
             if (intermediate == tokenIn || intermediate == tokenOut) continue;
 
             for (uint i = 0; i < v3FeeTiers.length; i++) {
-                uint24 fee1 = v3FeeTiers[i];
-
                 (address pool1, uint24 bestFee1, uint256 amountMid, uint256 impact1) = _getBestV3Pool(
                     factory, tokenIn, intermediate, amountIn
                 );
 
                 if (pool1 == address(0) || amountMid == 0) continue;
 
-                (address pool2, uint24 bestFee2, uint256 hopOut, uint256 impact2) = _getBestV3Pool(
+                (address pool2, , uint256 hopOut, uint256 impact2) = _getBestV3Pool(
                     factory, intermediate, tokenOut, amountMid
                 );
 
@@ -2580,10 +2578,10 @@ contract MonBridgeDex {
 
     /// @notice Iteratively optimize intra-router split percentages
     function _optimizeIntraRouterSplit(
-        address router,
+        address /* router */,
         address factory,
         address tokenIn,
-        address tokenOut,
+        address /* tokenOut */,
         uint256 totalAmount,
         FeeTierQuote[] memory quotes,
         uint16[] memory percentages
@@ -2614,11 +2612,11 @@ contract MonBridgeDex {
                     }
                 } else if (quotes[i].path.length == 3) {
                     // Multi-hop path
-                    (address pool1, uint24 fee1, uint256 amountMid, uint256 impact1) = _getBestV3Pool(
+                    (address pool1, , uint256 amountMid, uint256 impact1) = _getBestV3Pool(
                         factory, quotes[i].path[0], quotes[i].path[1], splitAmount
                     );
                     if (pool1 != address(0) && amountMid > 0) {
-                        (address pool2, uint24 fee2, uint256 hopOut, uint256 impact2) = _getBestV3Pool(
+                        (address pool2, , uint256 hopOut, uint256 impact2) = _getBestV3Pool(
                             factory, quotes[i].path[1], quotes[i].path[2], amountMid
                         );
                         if (pool2 != address(0)) {
@@ -2708,8 +2706,8 @@ contract MonBridgeDex {
     function getEnhancedSplitSwapData(
         uint amountIn,
         address[] calldata path,
-        bool supportFeeOnTransfer,
-        uint16 userSlippageBPS
+        bool /* supportFeeOnTransfer */,
+        uint16 /* userSlippageBPS */
     ) external view returns (
         RouterStrategy[] memory strategies,
         uint256 totalExpectedOutput,
@@ -2774,12 +2772,12 @@ contract MonBridgeDex {
                     if (tierQuotes.length > 0 && tierOut > 0) {
                         strategies[i].internalSplits = new InternalSplit[](tierQuotes.length);
                         for (uint j = 0; j < tierQuotes.length; j++) {
-                            uint24[] memory fees = new uint24[](tierQuotes[j].path.length - 1);
-                            fees[0] = tierQuotes[j].feeTier;
+                            uint24[] memory tierFees = new uint24[](tierQuotes[j].path.length - 1);
+                            tierFees[0] = tierQuotes[j].feeTier;
 
                             strategies[i].internalSplits[j] = InternalSplit({
                                 path: tierQuotes[j].path,
-                                v3Fees: fees,
+                                v3Fees: tierFees,
                                 percentageBPS: tierPcts[j],
                                 amountOut: tierQuotes[j].amountOut,
                                 priceImpact: tierQuotes[j].priceImpact
@@ -3915,7 +3913,7 @@ contract MonBridgeDex {
             if (factory == address(0)) continue;
 
             if (path.length == 2) {
-                (address bestPool, uint24 bestFee, uint amountOut, ) = _getBestV3Pool(factory, path[0], path[1], amountForSwap);
+                (address bestPool, , uint amountOut, ) = _getBestV3Pool(factory, path[0], path[1], amountForSwap);
                 if (bestPool != address(0) && amountOut > v3Best) {
                     v3Best = amountOut;
                     v3Router = routersV3[i];
