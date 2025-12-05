@@ -1049,7 +1049,7 @@ contract MonBridgeDex {
     }
 
     /// @notice Find best V3 pool with optimal fee tier selection
-    /// @dev Prioritizes: 1) Net output after impact penalty, 2) Lower fee tier on ties
+    /// @dev Prioritizes: 1) Actual amountOut (RAW, no penalties), 2) Lower impact as tie-breaker
     /// @dev Returns address(0) if NO valid pool found - ensures we never return a failing pool
     function _getBestV3Pool(
         address factory,
@@ -1066,7 +1066,6 @@ contract MonBridgeDex {
         bestImpact = type(uint).max;
         bestPool = address(0);
         bestFee = 0;
-        uint256 bestScore = 0;
 
         for (uint i = 0; i < v3FeeTiers.length; i++) {
             uint24 fee = v3FeeTiers[i];
@@ -1090,21 +1089,19 @@ contract MonBridgeDex {
             // Skip pools that return 0 or max impact (indicates calculation failed)
             if (amountOut == 0 || impact == type(uint256).max) continue;
 
-            // Calculate score: amountOut - impact penalty
-            // Higher impact = higher penalty
-            uint256 impactPenalty = (amountOut * impact) / 10000;
-            uint256 score = amountOut > impactPenalty ? amountOut - impactPenalty : 0;
-
-            // Fallback: If penalty would zero the score but we have a valid amountOut,
-            // use raw amountOut for comparison to avoid filtering out all pools
-            // This ensures we always select the best available pool even with high impact
-            if (score == 0 && amountOut > 0) {
-                score = amountOut;
+            // CRITICAL FIX: Compare RAW amountOut without ANY penalties
+            // V3 should ALWAYS win if it gives more tokens
+            // Impact is ONLY a tie-breaker for identical outputs
+            bool isBetter = false;
+            if (amountOut > bestAmountOut) {
+                // Clearly better output
+                isBetter = true;
+            } else if (amountOut == bestAmountOut && impact < bestImpact) {
+                // Same output, better impact
+                isBetter = true;
             }
 
-            // Select best score, with lower fee tier as tie-breaker
-            if (score > bestScore || (score == bestScore && fee < bestFee)) {
-                bestScore = score;
+            if (isBetter) {
                 bestAmountOut = amountOut;
                 bestPool = pool;
                 bestFee = fee;
@@ -1307,8 +1304,8 @@ contract MonBridgeDex {
         }
     }
 
-    /// @notice Find best router (V2 or V3) with highest output and lowest price impact
-    /// @dev Uses accurate price impact calculations for both V2 and V3
+    /// @notice Find best router (V2 or V3) with highest output (NO BIAS)
+    /// @dev Compares RAW outputs - V3 wins if it gives more tokens, V2 wins if it gives more tokens
     function _getBestRouter(uint amountIn, address[] memory path) internal view returns (
         address bestRouter,
         uint bestAmountOut,
@@ -1324,6 +1321,7 @@ contract MonBridgeDex {
         bestPriceImpact = type(uint).max;
         bestPath = path;
 
+        // CRITICAL: NO BIAS - whoever gives highest amountOut wins
         // Check all V2 routers with direct and multi-hop paths
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
@@ -1332,6 +1330,7 @@ contract MonBridgeDex {
             if (_validateV2Path(routersV2[i], path)) {
                 (uint256 amountOut, uint256 impact) = _calculateV2SwapOutput(routersV2[i], path, amountIn);
 
+                // V2 route - accept if output is higher (NO penalties)
                 if (amountOut > 0 && amountOut > bestAmountOut) {
                     bestAmountOut = amountOut;
                     bestRouter = routersV2[i];
@@ -1365,6 +1364,7 @@ contract MonBridgeDex {
         }
 
         // Check all V3 routers (supports single and multi-hop)
+        // CRITICAL: V3 competes EQUALLY with V2 - no bias
         for (uint i = 0; i < routersV3.length; i++) {
             if (!_validateRouter(routersV3[i])) continue;
 
@@ -1372,7 +1372,7 @@ contract MonBridgeDex {
             if (factory == address(0)) continue;
 
             if (path.length == 2) {
-                // Single-hop V3
+                // Single-hop V3 - DIRECT comparison with V2
                 (address bestPool, uint24 bestFee, uint amountOut, uint impact) = _getBestV3Pool(
                     factory,
                     path[0],
@@ -1380,7 +1380,9 @@ contract MonBridgeDex {
                     amountIn
                 );
 
-                if (bestPool != address(0) && amountOut > bestAmountOut) {
+                // V3 route - accept if output is higher (NO penalties, NO bias)
+                // V3 MUST compete fairly with V2
+                if (bestPool != address(0) && amountOut > 0 && amountOut > bestAmountOut) {
                     bestAmountOut = amountOut;
                     bestRouter = routersV3[i];
                     bestRouterType = RouterType.V3;
@@ -2011,6 +2013,7 @@ contract MonBridgeDex {
 
     /// @notice Comprehensive swap data function that automatically handles single, multi-hop, and split strategies
     /// @dev This is the recommended entry point - automatically chooses optimal strategy based on price impact
+    /// @dev NOW WITH INTRA-ROUTER FEE TIER DISTRIBUTION for V3 routers
     /// @param amountIn Input amount
     /// @param path Token path for the swap
     /// @param supportFeeOnTransfer Whether to support fee-on-transfer tokens
@@ -2047,26 +2050,99 @@ contract MonBridgeDex {
             _getBestRouterWithPath(amountForSwap, path);
 
         // Step 2: Check if splitting would give better results (if enabled)
-        // When alwaysSplit is enabled, ALWAYS try splitting regardless of current impact
         uint splitOutput = 0;
         uint splitImpact = type(uint).max;
         bool splitAvailable = false;
 
-        // Always try splitting if alwaysSplit is enabled OR if impact exceeds threshold
         bool shouldTrySplit = splitConfig.enableAutoSplit && 
             (splitConfig.alwaysSplit || singleImpact >= splitConfig.minSplitImpactBPS);
 
         if (shouldTrySplit) {
-            // Try to calculate split strategy
+            // ENHANCED: Use intra-router fee tier distribution if enabled
+            if (splitConfig.enableIntraRouterSplit && path.length == 2) {
+                // Get enhanced splits with fee tier distribution
+                (RouterStrategy[] memory strategies, uint totalOut, uint avgImpact) = 
+                    this.getEnhancedSplitSwapData(amountIn, path, supportFeeOnTransfer, userSlippageBPS);
+                
+                if (strategies.length > 0 && totalOut > 0) {
+                    splitOutput = totalOut;
+                    splitImpact = avgImpact;
+                    splitAvailable = true;
+                    
+                    // Convert strategies to SwapData array
+                    // Count total number of swaps needed (each internal split = one swap)
+                    uint totalSwaps = 0;
+                    for (uint i = 0; i < strategies.length; i++) {
+                        totalSwaps += strategies[i].internalSplits.length;
+                    }
+                    
+                    if (totalSwaps > 0) {
+                        SwapData[] memory enhancedSplits = new SwapData[](totalSwaps);
+                        uint16[] memory enhancedPercentages = new uint16[](totalSwaps);
+                        uint swapIdx = 0;
+                        
+                        for (uint i = 0; i < strategies.length; i++) {
+                            for (uint j = 0; j < strategies[i].internalSplits.length; j++) {
+                                InternalSplit memory intSplit = strategies[i].internalSplits[j];
+                                
+                                // Calculate percentage: router allocation * internal split percentage
+                                uint16 combinedPct = uint16((uint256(strategies[i].allocationBPS) * uint256(intSplit.percentageBPS)) / 10000);
+                                enhancedPercentages[swapIdx] = combinedPct;
+                                
+                                uint splitAmountGross = (amountIn * combinedPct) / 10000;
+                                
+                                SwapType swapType;
+                                if (intSplit.path[0] == WETH) {
+                                    swapType = SwapType.ETH_TO_TOKEN;
+                                } else if (intSplit.path[intSplit.path.length - 1] == WETH) {
+                                    swapType = SwapType.TOKEN_TO_ETH;
+                                } else {
+                                    swapType = SwapType.TOKEN_TO_TOKEN;
+                                }
+                                
+                                uint splitExpectedOut = (intSplit.amountOut * combinedPct) / 10000;
+                                uint splitMinOut = _calculateAdaptiveSlippage(splitExpectedOut, intSplit.priceImpact, userSlippageBPS);
+                                
+                                enhancedSplits[swapIdx] = SwapData({
+                                    swapType: swapType,
+                                    routerType: strategies[i].routerType,
+                                    router: strategies[i].router,
+                                    path: intSplit.path,
+                                    v3Fees: intSplit.v3Fees,
+                                    amountIn: splitAmountGross,
+                                    amountOutMin: splitMinOut,
+                                    deadline: block.timestamp + 300,
+                                    supportFeeOnTransfer: supportFeeOnTransfer
+                                });
+                                
+                                swapIdx++;
+                            }
+                        }
+                        
+                        uint totalMinOut = _calculateAdaptiveSlippage(splitOutput, splitImpact, userSlippageBPS);
+                        splitSwapData = SplitSwapData({
+                            splits: enhancedSplits,
+                            totalAmountIn: amountIn,
+                            totalAmountOutMin: totalMinOut,
+                            splitPercentages: enhancedPercentages
+                        });
+                        
+                        useSplit = true;
+                        estimatedOutput = splitOutput;
+                        totalPriceImpact = splitImpact;
+                        return (useSplit, singleSwapData, splitSwapData, estimatedOutput, totalPriceImpact);
+                    }
+                }
+            }
+            
+            // Fallback to standard cross-router splitting (no fee tier distribution)
             (RouterQuote[] memory quotes, uint16[] memory percentages, uint totalExpectedOut) =
                 _calculateOptimalSplits(amountForSwap, path, splitConfig.maxSplits);
 
-            // Accept splits even with single router when alwaysSplit is enabled
             if ((quotes.length >= 2 || (quotes.length >= 1 && splitConfig.alwaysSplit)) && totalExpectedOut > 0) {
                 splitOutput = totalExpectedOut;
                 splitAvailable = true;
 
-                // Calculate weighted average price impact for splits
                 uint weightedImpact = 0;
                 for (uint i = 0; i < quotes.length; i++) {
                     weightedImpact += quotes[i].priceImpact * percentages[i];
@@ -2076,27 +2152,18 @@ contract MonBridgeDex {
         }
 
         // Step 3: Decide whether to use single or split
-        // IMPORTANT: Always consider fees - only split if output is equal or better
-        // Split routes have pool fees baked into amountOut, so we compare total outputs
-        // Use split if: split is available AND split output >= single output (accounting for all pool fees)
         if (splitConfig.alwaysSplit) {
-            // With alwaysSplit: use split if output is at least equal (fees are already in amountOut)
-            // This ensures we never lose money by splitting - pool fees are accounted for in quotes
             useSplit = splitAvailable && splitOutput > 0 && splitOutput >= singleOutput;
         } else {
-            // Without alwaysSplit: only split if meaningfully better output or lower impact
             useSplit = splitAvailable && (splitOutput > singleOutput || (splitOutput >= singleOutput * 99 / 100 && splitImpact < singleImpact));
         }
 
         if (useSplit) {
-            // Build split swap data
             (RouterQuote[] memory quotes, uint16[] memory percentages, ) =
                 _calculateOptimalSplits(amountForSwap, path, splitConfig.maxSplits);
 
             SwapData[] memory splits = new SwapData[](quotes.length);
             for (uint i = 0; i < quotes.length; i++) {
-                // Use GROSS amount for execution - execute() will deduct fees
-                // The quote comparison uses post-fee, but execution needs gross
                 uint splitAmountGross = (amountIn * percentages[i]) / 10000;
 
                 SwapType swapType;
@@ -2128,7 +2195,7 @@ contract MonBridgeDex {
                     router: quotes[i].router,
                     path: quotes[i].path,
                     v3Fees: splitV3Fees,
-                    amountIn: splitAmountGross, // Gross amount - execute() deducts fees
+                    amountIn: splitAmountGross,
                     amountOutMin: splitMinOut,
                     deadline: block.timestamp + 300,
                     supportFeeOnTransfer: supportFeeOnTransfer
@@ -2138,7 +2205,7 @@ contract MonBridgeDex {
             uint totalMinOut = _calculateAdaptiveSlippage(splitOutput, splitImpact, userSlippageBPS);
             splitSwapData = SplitSwapData({
                 splits: splits,
-                totalAmountIn: amountIn, // Gross total for execution
+                totalAmountIn: amountIn,
                 totalAmountOutMin: totalMinOut,
                 splitPercentages: percentages
             });
@@ -2146,7 +2213,6 @@ contract MonBridgeDex {
             estimatedOutput = splitOutput;
             totalPriceImpact = splitImpact;
         } else {
-            // Build single swap data
             require(bestRouter != address(0), "MonBridgeDex: No valid route found");
 
             SwapType swapType;
@@ -2183,7 +2249,8 @@ contract MonBridgeDex {
     }
 
     /// @notice Get quotes from all available routers using all intermediate tokens
-    /// @dev Returns individual quotes for splitting - each router+path combo is a quote
+    /// @dev Returns individual quotes for splitting - FAIR V2 vs V3 comparison
+    /// @dev CRITICAL: V3 quotes are NOT penalized - raw amountOut comparison
     function _getAllRouterQuotes(uint amountIn, address[] memory path) internal view returns (RouterQuote[] memory) {
         // Account for all intermediate tokens and multiple fee tiers
         uint maxQuotes = routersV2.length * (1 + intermediateTokens.length) + 
@@ -2325,22 +2392,24 @@ contract MonBridgeDex {
         return quotes;
     }
 
-    /// @notice Get BEST quote per router (not per fee tier) for proper split counting
-    /// @dev This ensures splits only count different routers, not different fee tiers
+    /// @notice Get BEST quote per router+type combination for V2+V3 hybrid splits
+    /// @dev Allows mixing V2 and V3 routers in splits by treating router+type as unique
     function _getBestQuotePerRouter(uint amountIn, address[] memory path) internal view returns (RouterQuote[] memory) {
         RouterQuote[] memory allQuotes = _getAllRouterQuotes(amountIn, path);
 
-        // Find unique routers and keep best quote for each
+        // Find unique router+type combos and keep best quote for each
         uint uniqueCount = 0;
         address[] memory seenRouters = new address[](routersV2.length + routersV3.length);
+        RouterType[] memory seenTypes = new RouterType[](routersV2.length + routersV3.length);
         RouterQuote[] memory bestPerRouter = new RouterQuote[](routersV2.length + routersV3.length);
 
         for (uint i = 0; i < allQuotes.length; i++) {
             bool found = false;
             uint routerIdx = 0;
 
+            // FIXED: Check router AND type to allow same router address for V2 and V3
             for (uint j = 0; j < uniqueCount; j++) {
-                if (seenRouters[j] == allQuotes[i].router) {
+                if (seenRouters[j] == allQuotes[i].router && seenTypes[j] == allQuotes[i].routerType) {
                     found = true;
                     routerIdx = j;
                     break;
@@ -2349,10 +2418,11 @@ contract MonBridgeDex {
 
             if (!found) {
                 seenRouters[uniqueCount] = allQuotes[i].router;
+                seenTypes[uniqueCount] = allQuotes[i].routerType;
                 bestPerRouter[uniqueCount] = allQuotes[i];
                 uniqueCount++;
             } else if (allQuotes[i].amountOut > bestPerRouter[routerIdx].amountOut) {
-                // Update with better quote for same router
+                // Update with better quote for same router+type
                 bestPerRouter[routerIdx] = allQuotes[i];
             }
         }
@@ -3003,6 +3073,7 @@ contract MonBridgeDex {
 
             // ALWAYS try routing through ALL intermediate tokens (not just when direct fails)
             // This ensures we never miss better hop opportunities
+            // TRY BOTH DIRECTIONS: Token→Intermediate→Out AND Token→Out→Intermediate
             if (path.length == 2) {
                 for (uint k = 0; k < intermediateTokens.length; k++) {
                     address intermediateToken = intermediateTokens[k];
@@ -3010,21 +3081,40 @@ contract MonBridgeDex {
                     // Skip if intermediate is same as input or output
                     if (intermediateToken == path[0] || intermediateToken == path[1]) continue;
 
-                    address[] memory hopPath = new address[](3);
-                    hopPath[0] = path[0];
-                    hopPath[1] = intermediateToken;
-                    hopPath[2] = path[1];
+                    // Direction 1: Token → Intermediate → Out
+                    address[] memory hopPath1 = new address[](3);
+                    hopPath1[0] = path[0];
+                    hopPath1[1] = intermediateToken;
+                    hopPath1[2] = path[1];
 
-                    if (_validateV2Path(routersV2[i], hopPath)) {
-                        (uint256 hopAmountOut, uint256 hopImpact) = _calculateV2SwapOutput(routersV2[i], hopPath, amountIn);
+                    if (_validateV2Path(routersV2[i], hopPath1)) {
+                        (uint256 hopAmountOut, uint256 hopImpact) = _calculateV2SwapOutput(routersV2[i], hopPath1, amountIn);
 
-                        // Use hop route if it gives better output
                         if (hopAmountOut > 0 && hopAmountOut > bestAmountOut) {
                             bestAmountOut = hopAmountOut;
                             bestRouter = routersV2[i];
                             bestRouterType = RouterType.V2;
                             bestPriceImpact = hopImpact;
-                            bestPath = hopPath;
+                            bestPath = hopPath1;
+                        }
+                    }
+
+                    // Direction 2: Token → Out → Intermediate (reverse intermediate)
+                    // This catches cases where liquidity is better in reverse order
+                    address[] memory hopPath2 = new address[](3);
+                    hopPath2[0] = path[0];
+                    hopPath2[1] = path[1];
+                    hopPath2[2] = intermediateToken;
+
+                    if (_validateV2Path(routersV2[i], hopPath2)) {
+                        (uint256 hopAmountOut2, uint256 hopImpact2) = _calculateV2SwapOutput(routersV2[i], hopPath2, amountIn);
+
+                        if (hopAmountOut2 > 0 && hopAmountOut2 > bestAmountOut) {
+                            bestAmountOut = hopAmountOut2;
+                            bestRouter = routersV2[i];
+                            bestRouterType = RouterType.V2;
+                            bestPriceImpact = hopImpact2;
+                            bestPath = hopPath2;
                         }
                     }
                 }
@@ -3058,41 +3148,76 @@ contract MonBridgeDex {
                 }
 
                 // ALWAYS try multi-hop through ALL intermediate tokens
+                // TRY BOTH DIRECTIONS for V3 as well
                 for (uint k = 0; k < intermediateTokens.length; k++) {
                     address intermediateToken = intermediateTokens[k];
 
                     // Skip if intermediate is same as input or output
                     if (intermediateToken == path[0] || intermediateToken == path[1]) continue;
 
-                    address[] memory hopPath = new address[](3);
-                    hopPath[0] = path[0];
-                    hopPath[1] = intermediateToken;
-                    hopPath[2] = path[1];
+                    // Direction 1: Token → Intermediate → Out
+                    address[] memory hopPath1 = new address[](3);
+                    hopPath1[0] = path[0];
+                    hopPath1[1] = intermediateToken;
+                    hopPath1[2] = path[1];
 
-                    (address pool1, uint24 fee1, uint amountMid, uint impact1) = _getBestV3Pool(
+                    (address pool1a, uint24 fee1a, uint amountMid1, uint impact1a) = _getBestV3Pool(
                         factory,
-                        hopPath[0],
-                        hopPath[1],
+                        hopPath1[0],
+                        hopPath1[1],
                         amountIn
                     );
 
-                    if (pool1 != address(0) && amountMid > 0) {
-                        (address pool2, uint24 fee2, uint hopOut, uint impact2) = _getBestV3Pool(
+                    if (pool1a != address(0) && amountMid1 > 0) {
+                        (address pool2a, uint24 fee2a, uint hopOut1, uint impact2a) = _getBestV3Pool(
                             factory,
-                            hopPath[1],
-                            hopPath[2],
-                            amountMid
+                            hopPath1[1],
+                            hopPath1[2],
+                            amountMid1
                         );
 
-                        if (pool2 != address(0) && hopOut > 0 && hopOut > bestAmountOut) {
-                            bestAmountOut = hopOut;
+                        if (pool2a != address(0) && hopOut1 > 0 && hopOut1 > bestAmountOut) {
+                            bestAmountOut = hopOut1;
                             bestRouter = routersV3[i];
                             bestRouterType = RouterType.V3;
                             bestV3Fees = new uint24[](2);
-                            bestV3Fees[0] = fee1;
-                            bestV3Fees[1] = fee2;
-                            bestPriceImpact = impact1 + impact2;
-                            bestPath = hopPath;
+                            bestV3Fees[0] = fee1a;
+                            bestV3Fees[1] = fee2a;
+                            bestPriceImpact = impact1a + impact2a;
+                            bestPath = hopPath1;
+                        }
+                    }
+
+                    // Direction 2: Token → Out → Intermediate
+                    address[] memory hopPath2 = new address[](3);
+                    hopPath2[0] = path[0];
+                    hopPath2[1] = path[1];
+                    hopPath2[2] = intermediateToken;
+
+                    (address pool1b, uint24 fee1b, uint amountMid2, uint impact1b) = _getBestV3Pool(
+                        factory,
+                        hopPath2[0],
+                        hopPath2[1],
+                        amountIn
+                    );
+
+                    if (pool1b != address(0) && amountMid2 > 0) {
+                        (address pool2b, uint24 fee2b, uint hopOut2, uint impact2b) = _getBestV3Pool(
+                            factory,
+                            hopPath2[1],
+                            hopPath2[2],
+                            amountMid2
+                        );
+
+                        if (pool2b != address(0) && hopOut2 > 0 && hopOut2 > bestAmountOut) {
+                            bestAmountOut = hopOut2;
+                            bestRouter = routersV3[i];
+                            bestRouterType = RouterType.V3;
+                            bestV3Fees = new uint24[](2);
+                            bestV3Fees[0] = fee1b;
+                            bestV3Fees[1] = fee2b;
+                            bestPriceImpact = impact1b + impact2b;
+                            bestPath = hopPath2;
                         }
                     }
                 }
