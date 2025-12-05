@@ -47,6 +47,36 @@ interface IUniswapV2Router02 {
     function factory() external pure returns (address);
 }
 
+/// @notice Interface for V2 forks that use NATIVE instead of ETH naming (e.g., some Monad forks)
+interface IV2RouterNative {
+    function swapExactNATIVEForTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable returns (uint[] memory amounts);
+    function swapExactTokensForNATIVE(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+    function swapExactNATIVEForTokensSupportingFeeOnTransferTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable;
+    function swapExactTokensForNATIVESupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+}
+
 interface IUniswapV2Factory {
     function getPair(address tokenA, address tokenB) external view returns (address pair);
 }
@@ -189,8 +219,39 @@ library FixedPoint96 {
     uint256 internal constant Q96 = 0x1000000000000000000000000;
 }
 
+/// @notice Interface for V2 forks that use NATIVE instead of ETH naming
+interface IUniswapV2RouterNative {
+    function swapExactNATIVEForTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable returns (uint[] memory amounts);
+    function swapExactTokensForNATIVE(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+    function swapExactNATIVEForTokensSupportingFeeOnTransferTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable;
+    function swapExactTokensForNATIVESupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+}
+
 /// @title MonBridgeDex
 /// @notice Production-grade DEX aggregator with Uniswap V2 and V3 support
+/// @dev Enhanced with multi-intermediate token hopping, aggressive split optimization, and arbitrage detection
 contract MonBridgeDex {
     address public owner;
     address[] public routersV2;
@@ -205,6 +266,14 @@ contract MonBridgeDex {
     uint public constant FEE_DIVISOR = 1000; // 0.1% fee
 
     address public WETH;
+    
+    // Intermediate tokens for multi-hop routing (WETH + USDC + others)
+    address[] public intermediateTokens;
+    mapping(address => bool) public isIntermediateToken;
+    uint public constant MAX_INTERMEDIATE_TOKENS = 10;
+    
+    // Router capability flags for different swap function signatures
+    mapping(address => bool) public usesNativeNaming; // Uses swapExactNATIVEForTokens instead of ETH
 
     bool private _locked;
     bool public paused;
@@ -319,6 +388,34 @@ contract MonBridgeDex {
         uint priceImpact;
         address[] path;
     }
+    
+    // Enhanced quote structure for per-router internal optimization
+    struct EnhancedRouterQuote {
+        address router;
+        RouterType routerType;
+        uint totalAmountOut;
+        uint totalPriceImpact;
+        InternalSplit[] internalSplits; // Multiple paths/fees within same router
+    }
+    
+    // Internal split within a single router (different fee tiers or paths)
+    struct InternalSplit {
+        address[] path;
+        uint24[] v3Fees;
+        uint16 percentageBPS; // Percentage of this router's allocation
+        uint amountOut;
+        uint priceImpact;
+    }
+    
+    // Aggregated router strategy for split optimization
+    struct RouterStrategy {
+        address router;
+        RouterType routerType;
+        uint16 allocationBPS; // Percentage of total trade
+        InternalSplit[] internalSplits;
+        uint expectedOutput;
+        uint averageImpact;
+    }
 
     uint24[] public v3FeeTiers;
 
@@ -351,13 +448,21 @@ contract MonBridgeDex {
     event PriceImpactWarning(address indexed user, uint priceImpact, uint threshold);
     event RouterHealthUpdate(address indexed router, bool isActive, uint failureCount);
 
-    constructor(address _weth) {
+    constructor(address _weth, address _usdc) {
         owner = msg.sender;
         WETH = _weth;
         v3FeeTiers.push(100);
         v3FeeTiers.push(500);
         v3FeeTiers.push(3000);
         v3FeeTiers.push(10000);
+        
+        // Initialize intermediate tokens with WETH and USDC
+        intermediateTokens.push(_weth);
+        isIntermediateToken[_weth] = true;
+        if (_usdc != address(0)) {
+            intermediateTokens.push(_usdc);
+            isIntermediateToken[_usdc] = true;
+        }
 
         slippageConfig = SlippageConfig({
             baseSlippageBPS: 50,
@@ -483,6 +588,40 @@ contract MonBridgeDex {
                 break;
             }
         }
+    }
+    
+    /// @notice Add an intermediate token for multi-hop routing
+    function addIntermediateToken(address _token) external onlyOwner {
+        require(_token != address(0), "Invalid token address");
+        require(!isIntermediateToken[_token], "Token already added");
+        require(intermediateTokens.length < MAX_INTERMEDIATE_TOKENS, "Max intermediate tokens reached");
+        intermediateTokens.push(_token);
+        isIntermediateToken[_token] = true;
+    }
+    
+    /// @notice Remove an intermediate token
+    function removeIntermediateToken(address _token) external onlyOwner {
+        require(isIntermediateToken[_token], "Token not found");
+        require(_token != WETH, "Cannot remove WETH");
+        for (uint i = 0; i < intermediateTokens.length; i++) {
+            if (intermediateTokens[i] == _token) {
+                intermediateTokens[i] = intermediateTokens[intermediateTokens.length - 1];
+                intermediateTokens.pop();
+                isIntermediateToken[_token] = false;
+                break;
+            }
+        }
+    }
+    
+    /// @notice Get all intermediate tokens
+    function getIntermediateTokens() external view returns (address[] memory) {
+        return intermediateTokens;
+    }
+    
+    /// @notice Set router capability - uses NATIVE naming convention
+    function setRouterUsesNativeNaming(address _router, bool _usesNative) external onlyOwner {
+        require(isRouterV2[_router], "Router not V2");
+        usesNativeNaming[_router] = _usesNative;
     }
 
     /// @notice Get all V2 routers
@@ -896,7 +1035,7 @@ contract MonBridgeDex {
     }
 
     /// @notice Calculate accurate V2 price impact using constant product AMM formula
-    /// @dev Compares ideal output (spot price) with actual output from AMM
+    /// @dev Uses router-reported amounts for per-hop impact calculation with overflow protection
     /// @param router V2 router address
     /// @param path Token path for the swap
     /// @param amountIn Input amount
@@ -907,7 +1046,11 @@ contract MonBridgeDex {
         address[] memory path,
         uint256 amountIn
     ) internal view returns (uint256 actualOutput, uint256 priceImpact) {
+        // Edge case: invalid input
         if (path.length < 2 || amountIn == 0) return (0, type(uint256).max);
+        
+        // Edge case: excessively large trade amounts (overflow protection)
+        if (amountIn > type(uint112).max) return (0, type(uint256).max);
 
         try IUniswapV2Router02(router).factory() returns (address factory) {
             if (factory == address(0)) return (0, type(uint256).max);
@@ -923,23 +1066,26 @@ contract MonBridgeDex {
 
             if (actualOutput == 0) return (0, type(uint256).max);
 
-            // Calculate cumulative price impact across all hops
-            uint256 cumulativeIdealOutput = amountIn;
-            uint256 cumulativeActualOutput = amountIn;
+            // Calculate per-hop price impact using router-reported amounts
+            uint256 totalImpact = 0;
 
             for (uint i = 0; i < path.length - 1; i++) {
                 address tokenIn = path[i];
                 address tokenOut = path[i + 1];
+                uint256 hopAmountIn = amounts[i];
+                uint256 hopAmountOut = amounts[i + 1];
 
                 // Get pair address
                 address pair;
                 try IUniswapV2Factory(factory).getPair(tokenIn, tokenOut) returns (address p) {
                     pair = p;
                 } catch {
-                    return (actualOutput, 0); // Fall back to no impact if pair query fails
+                    // CRITICAL: Return MAX impact on pair query failure (not 0)
+                    return (0, type(uint256).max);
                 }
 
-                if (pair == address(0)) return (actualOutput, 0);
+                // Edge case: pair doesn't exist
+                if (pair == address(0)) return (0, type(uint256).max);
 
                 // Get reserves
                 uint112 reserve0;
@@ -948,15 +1094,18 @@ contract MonBridgeDex {
                     reserve0 = r0;
                     reserve1 = r1;
                 } catch {
-                    return (actualOutput, 0);
+                    return (0, type(uint256).max);
                 }
+
+                // Edge case: zero liquidity - return maximum impact
+                if (reserve0 == 0 || reserve1 == 0) return (0, type(uint256).max);
 
                 // Determine which reserve is for which token
                 address token0;
                 try IUniswapV2Pair(pair).token0() returns (address t0) {
                     token0 = t0;
                 } catch {
-                    return (actualOutput, 0);
+                    return (0, type(uint256).max);
                 }
 
                 uint256 reserveIn;
@@ -969,30 +1118,36 @@ contract MonBridgeDex {
                     reserveOut = uint256(reserve0);
                 }
 
-                if (reserveIn == 0 || reserveOut == 0) return (actualOutput, 0);
+                // Edge case: minimum liquidity check (avoid dust pools)
+                uint256 MIN_LIQUIDITY = 1000;
+                if (reserveIn < MIN_LIQUIDITY || reserveOut < MIN_LIQUIDITY) {
+                    return (0, type(uint256).max);
+                }
+
+                // Edge case: trade would deplete more than 50% of reserves (extreme impact)
+                if (hopAmountIn > reserveIn / 2) {
+                    return (actualOutput, 5000); // Return 50% impact
+                }
 
                 // Calculate ideal output at spot price (no slippage)
-                // Ideal: amountOut = (amountIn * reserveOut) / reserveIn
-                uint256 hopIdeal = (cumulativeActualOutput * reserveOut) / reserveIn;
-                
-                // Actual output uses AMM formula with 0.3% fee:
-                // amountOut = (amountIn * 997 * reserveOut) / (reserveIn * 1000 + amountIn * 997)
-                uint256 amountInWithFee = cumulativeActualOutput * 997;
-                uint256 numerator = amountInWithFee * reserveOut;
-                uint256 denominator = reserveIn * 1000 + amountInWithFee;
-                uint256 hopActual = numerator / denominator;
+                // Using FullMath to prevent overflow
+                uint256 hopIdeal;
+                if (hopAmountIn <= type(uint128).max && reserveOut <= type(uint128).max) {
+                    hopIdeal = (hopAmountIn * reserveOut) / reserveIn;
+                } else {
+                    // Use FullMath for large numbers
+                    hopIdeal = FullMath.mulDiv(hopAmountIn, reserveOut, reserveIn);
+                }
 
-                cumulativeIdealOutput = hopIdeal;
-                cumulativeActualOutput = hopActual;
+                // Calculate per-hop impact: (idealOut - actualOut) / idealOut * 10000
+                if (hopIdeal > hopAmountOut && hopIdeal > 0) {
+                    uint256 hopImpact = ((hopIdeal - hopAmountOut) * 10000) / hopIdeal;
+                    totalImpact += hopImpact;
+                }
             }
 
-            // Calculate price impact: (idealOutput - actualOutput) / idealOutput * 10000
-            if (cumulativeIdealOutput > cumulativeActualOutput && cumulativeIdealOutput > 0) {
-                priceImpact = ((cumulativeIdealOutput - cumulativeActualOutput) * 10000) / cumulativeIdealOutput;
-            } else {
-                priceImpact = 0;
-            }
-
+            // Cap maximum impact at 10000 (100%)
+            priceImpact = totalImpact > 10000 ? 10000 : totalImpact;
             return (actualOutput, priceImpact);
         } catch {
             return (0, type(uint256).max);
@@ -1149,9 +1304,9 @@ contract MonBridgeDex {
         }
     }
 
-    /// @notice Calculate optimal split percentages across multiple routers
+    /// @notice Calculate optimal split percentages across multiple ROUTERS (not fee tiers)
     /// @dev Uses greedy algorithm to find best distribution minimizing total impact
-    /// @dev IMPORTANT: This function expects amountForSwap (post-fee amount) - fee is already deducted by caller
+    /// @dev IMPORTANT: Splits only count different routers - fee tier variations within same router don't increase split count
     function _calculateOptimalSplits(
         uint amountForSwap,
         address[] memory path,
@@ -1161,32 +1316,36 @@ contract MonBridgeDex {
         uint16[] memory percentages,
         uint totalExpectedOut
     ) {
-        // NOTE: Fee is already deducted by caller, do NOT deduct again
-        RouterQuote[] memory allQuotes = _getAllRouterQuotes(amountForSwap / 4, path); // Test with 25% chunks
+        // Use _getBestQuotePerRouter to ensure splits count ROUTERS not fee tiers
+        RouterQuote[] memory routerQuotes = _getBestQuotePerRouter(amountForSwap / 4, path);
 
-        if (allQuotes.length == 0) {
+        if (routerQuotes.length == 0) {
             return (new RouterQuote[](0), new uint16[](0), 0);
         }
 
         // Sort quotes by amountOut descending
-        allQuotes = _sortQuotesByOutput(allQuotes);
+        routerQuotes = _sortQuotesByOutput(routerQuotes);
 
-        // Determine optimal number of splits (2-4)
-        uint8 numSplits = maxSplitsAllowed > allQuotes.length ? uint8(allQuotes.length) : maxSplitsAllowed;
+        // Determine optimal number of splits (2-4) based on unique routers
+        uint8 numSplits = maxSplitsAllowed > routerQuotes.length ? uint8(routerQuotes.length) : maxSplitsAllowed;
         if (numSplits > 4) numSplits = 4;
-        if (numSplits < 2) numSplits = 2;
+        if (numSplits < 2) {
+            if (routerQuotes.length < 2) {
+                return (new RouterQuote[](0), new uint16[](0), 0);
+            }
+            numSplits = 2;
+        }
 
         selectedQuotes = new RouterQuote[](numSplits);
         percentages = new uint16[](numSplits);
 
-        // Copy top routers
+        // Copy top routers (each represents a unique router)
         for (uint i = 0; i < numSplits; i++) {
-            selectedQuotes[i] = allQuotes[i];
+            selectedQuotes[i] = routerQuotes[i];
         }
 
-        // Calculate optimal distribution using iterative refinement
-        // Use amountForSwap (post-fee) for output calculations
-        totalExpectedOut = _optimizeSplitPercentages(selectedQuotes, percentages, amountForSwap, path);
+        // Calculate optimal distribution using aggressive iterative refinement
+        totalExpectedOut = _optimizeSplitPercentagesAggressive(selectedQuotes, percentages, amountForSwap, path);
     }
 
     /// @notice Sort quotes by output amount (descending)
@@ -1204,31 +1363,43 @@ contract MonBridgeDex {
         return quotes;
     }
 
-    /// @notice Optimize split percentages to maximize output
-    function _optimizeSplitPercentages(
+    /// @notice Aggressive split percentage optimization to maximize output
+    /// @dev Uses 10 iterations with larger step sizes for more aggressive optimization
+    function _optimizeSplitPercentagesAggressive(
         RouterQuote[] memory quotes,
         uint16[] memory percentages,
         uint totalAmount,
         address[] memory path
     ) internal view returns (uint totalOut) {
         uint numSplits = quotes.length;
+        if (numSplits == 0) return 0;
 
-        // Start with equal distribution
-        uint16 equalShare = uint16(10000 / numSplits);
+        // Start with proportional distribution based on initial quote quality
+        uint totalQuoteOut = 0;
         for (uint i = 0; i < numSplits; i++) {
-            percentages[i] = equalShare;
+            totalQuoteOut += quotes[i].amountOut;
+        }
+        
+        if (totalQuoteOut > 0) {
+            uint16 remainingPct = 10000;
+            for (uint i = 0; i < numSplits - 1; i++) {
+                percentages[i] = uint16((quotes[i].amountOut * 10000) / totalQuoteOut);
+                remainingPct -= percentages[i];
+            }
+            percentages[numSplits - 1] = remainingPct;
+        } else {
+            // Fallback to equal distribution
+            uint16 equalShare = uint16(10000 / numSplits);
+            for (uint i = 0; i < numSplits; i++) {
+                percentages[i] = equalShare;
+            }
+            percentages[numSplits - 1] = uint16(10000 - uint16(equalShare) * uint16(numSplits - 1));
         }
 
-        // Adjust last percentage to ensure total = 10000 (100%)
-        uint16 totalPct = 0;
-        for (uint i = 0; i < numSplits - 1; i++) {
-            totalPct += percentages[i];
-        }
-        percentages[numSplits - 1] = 10000 - totalPct;
-
-        // Iterative optimization: shift allocation towards better routers
-        for (uint iteration = 0; iteration < 5; iteration++) {
+        // Aggressive iterative optimization: 10 iterations with larger step sizes
+        for (uint iteration = 0; iteration < 10; iteration++) {
             uint[] memory outputs = new uint[](numSplits);
+            uint[] memory impacts = new uint[](numSplits);
 
             // Calculate output for each split with current allocation
             for (uint i = 0; i < numSplits; i++) {
@@ -1236,51 +1407,86 @@ contract MonBridgeDex {
                 if (splitAmount == 0) continue;
 
                 if (quotes[i].routerType == RouterType.V2) {
-                    try IUniswapV2Router02(quotes[i].router).getAmountsOut(splitAmount, quotes[i].path) returns (uint[] memory amounts) {
-                        outputs[i] = amounts[amounts.length - 1];
-                    } catch {
-                        outputs[i] = 0;
-                    }
+                    (uint amtOut, uint impact) = _calculateV2SwapOutput(quotes[i].router, quotes[i].path, splitAmount);
+                    outputs[i] = amtOut;
+                    impacts[i] = impact;
                 } else {
                     address factory = v3RouterToFactory[quotes[i].router];
-                    address pool;
-                    try IUniswapV3Factory(factory).getPool(path[0], path[1], quotes[i].v3Fee) returns (address p) {
-                        pool = p;
-                    } catch {
-                        continue;
+                    if (factory == address(0)) continue;
+                    
+                    // Handle multi-hop V3 paths
+                    if (quotes[i].path.length == 2) {
+                        address pool;
+                        try IUniswapV3Factory(factory).getPool(quotes[i].path[0], quotes[i].path[1], quotes[i].v3Fee) returns (address p) {
+                            pool = p;
+                            if (pool != address(0)) {
+                                (uint out, uint impact) = _calculateV3SwapOutput(pool, splitAmount, quotes[i].path[0], quotes[i].v3Fee);
+                                outputs[i] = out;
+                                impacts[i] = impact;
+                            }
+                        } catch {}
+                    } else if (quotes[i].path.length == 3) {
+                        // Multi-hop: get intermediate output then final
+                        (address pool1, uint24 fee1, uint amountMid, uint impact1) = _getBestV3Pool(
+                            factory, quotes[i].path[0], quotes[i].path[1], splitAmount
+                        );
+                        if (pool1 != address(0) && amountMid > 0) {
+                            (address pool2, uint24 fee2, uint hopOut, uint impact2) = _getBestV3Pool(
+                                factory, quotes[i].path[1], quotes[i].path[2], amountMid
+                            );
+                            if (pool2 != address(0)) {
+                                outputs[i] = hopOut;
+                                impacts[i] = impact1 + impact2;
+                            }
+                        }
                     }
-                    (uint out, ) = _calculateV3SwapOutput(pool, splitAmount, path[0], quotes[i].v3Fee);
-                    outputs[i] = out;
                 }
             }
 
-            // Find router with best marginal return
+            // Find router with best efficiency (output per percentage with impact consideration)
             uint bestRouter = 0;
-            uint bestMarginal = 0;
+            uint bestEfficiency = 0;
             for (uint i = 0; i < numSplits; i++) {
-                if (percentages[i] >= 9500) continue; // Don't allocate more than 95% to one router
-                uint marginal = outputs[i] * 10000 / (percentages[i] > 0 ? percentages[i] : 1);
-                if (marginal > bestMarginal) {
-                    bestMarginal = marginal;
+                if (percentages[i] >= 8000) continue; // Don't allocate more than 80% to one router
+                if (outputs[i] == 0 || percentages[i] == 0) continue;
+                
+                // Efficiency score: output / percentage * (10000 - impact) / 10000
+                uint efficiency = (outputs[i] * 10000) / percentages[i];
+                efficiency = efficiency * (10000 - (impacts[i] > 10000 ? 10000 : impacts[i])) / 10000;
+                
+                if (efficiency > bestEfficiency) {
+                    bestEfficiency = efficiency;
                     bestRouter = i;
                 }
             }
 
-            // Shift 5% from worst to best (if beneficial)
+            // Find worst performer
             uint worstRouter = 0;
-            uint worstMarginal = type(uint).max;
+            uint worstEfficiency = type(uint).max;
             for (uint i = 0; i < numSplits; i++) {
-                if (i == bestRouter || percentages[i] <= 500) continue; // Keep at least 5%
-                uint marginal = outputs[i] * 10000 / percentages[i];
-                if (marginal < worstMarginal) {
-                    worstMarginal = marginal;
+                if (i == bestRouter || percentages[i] <= 200) continue; // Keep at least 2%
+                if (outputs[i] == 0) {
+                    worstRouter = i;
+                    worstEfficiency = 0;
+                    break;
+                }
+                
+                uint efficiency = (outputs[i] * 10000) / percentages[i];
+                efficiency = efficiency * (10000 - (impacts[i] > 10000 ? 10000 : impacts[i])) / 10000;
+                
+                if (efficiency < worstEfficiency) {
+                    worstEfficiency = efficiency;
                     worstRouter = i;
                 }
             }
 
-            if (bestMarginal > worstMarginal && percentages[worstRouter] >= 500) {
-                percentages[worstRouter] -= 500;
-                percentages[bestRouter] += 500;
+            // Aggressive shift: 10% per iteration (100 BPS)
+            uint16 shiftAmount = 1000; // 10%
+            if (iteration > 5) shiftAmount = 500; // Reduce to 5% for fine-tuning
+            
+            if (bestEfficiency > worstEfficiency && percentages[worstRouter] >= shiftAmount) {
+                percentages[worstRouter] -= shiftAmount;
+                percentages[bestRouter] += shiftAmount;
             }
         }
 
@@ -1295,14 +1501,30 @@ contract MonBridgeDex {
                 } catch {}
             } else {
                 address factory = v3RouterToFactory[quotes[i].router];
-                address pool;
-                try IUniswapV3Factory(factory).getPool(path[0], path[1], quotes[i].v3Fee) returns (address p) {
-                    pool = p;
-                } catch {
-                    continue;
+                if (factory == address(0)) continue;
+                
+                if (quotes[i].path.length == 2) {
+                    address pool;
+                    try IUniswapV3Factory(factory).getPool(quotes[i].path[0], quotes[i].path[1], quotes[i].v3Fee) returns (address p) {
+                        pool = p;
+                        if (pool != address(0)) {
+                            (uint out, ) = _calculateV3SwapOutput(pool, splitAmount, quotes[i].path[0], quotes[i].v3Fee);
+                            totalOut += out;
+                        }
+                    } catch {}
+                } else if (quotes[i].path.length == 3) {
+                    (address pool1, uint24 fee1, uint amountMid, ) = _getBestV3Pool(
+                        factory, quotes[i].path[0], quotes[i].path[1], splitAmount
+                    );
+                    if (pool1 != address(0) && amountMid > 0) {
+                        (address pool2, uint24 fee2, uint hopOut, ) = _getBestV3Pool(
+                            factory, quotes[i].path[1], quotes[i].path[2], amountMid
+                        );
+                        if (pool2 != address(0)) {
+                            totalOut += hopOut;
+                        }
+                    }
                 }
-                (uint out, ) = _calculateV3SwapOutput(pool, splitAmount, path[0], quotes[i].v3Fee);
-                totalOut += out;
             }
         }
     }
@@ -1644,21 +1866,24 @@ contract MonBridgeDex {
         }
     }
 
-    /// @notice Get quotes from all available routers
+    /// @notice Get quotes from all available routers using all intermediate tokens
+    /// @dev Returns individual quotes for splitting - each router+path combo is a quote
     function _getAllRouterQuotes(uint amountIn, address[] memory path) internal view returns (RouterQuote[] memory) {
-        uint maxQuotes = routersV2.length * 2 + routersV3.length * 4; // Account for WETH routing and multiple fee tiers
+        // Account for all intermediate tokens and multiple fee tiers
+        uint maxQuotes = routersV2.length * (1 + intermediateTokens.length) + 
+                         routersV3.length * v3FeeTiers.length * (1 + intermediateTokens.length);
         RouterQuote[] memory tempQuotes = new RouterQuote[](maxQuotes);
         uint quoteCount = 0;
 
-        // Get V2 quotes (direct path) with accurate price impact
+        // Get V2 quotes with all paths
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
 
-            // Try direct path - validate pair exists
+            // Try direct path
             if (_validateV2Path(routersV2[i], path)) {
                 (uint256 amountOut, uint256 impact) = _calculateV2SwapOutput(routersV2[i], path, amountIn);
                 
-                if (amountOut > 0) {
+                if (amountOut > 0 && quoteCount < maxQuotes) {
                     tempQuotes[quoteCount] = RouterQuote({
                         router: routersV2[i],
                         routerType: RouterType.V2,
@@ -1671,33 +1896,37 @@ contract MonBridgeDex {
                 }
             }
 
-            // Try WETH routing for token-to-token
-            if (path.length == 2 && path[0] != WETH && path[1] != WETH) {
-                address[] memory wethPath = new address[](3);
-                wethPath[0] = path[0];
-                wethPath[1] = WETH;
-                wethPath[2] = path[1];
+            // Try all intermediate token paths
+            if (path.length == 2) {
+                for (uint k = 0; k < intermediateTokens.length; k++) {
+                    address intermediate = intermediateTokens[k];
+                    if (intermediate == path[0] || intermediate == path[1]) continue;
+                    
+                    address[] memory hopPath = new address[](3);
+                    hopPath[0] = path[0];
+                    hopPath[1] = intermediate;
+                    hopPath[2] = path[1];
 
-                // Validate WETH path exists
-                if (_validateV2Path(routersV2[i], wethPath)) {
-                    (uint256 wethAmountOut, uint256 wethImpact) = _calculateV2SwapOutput(routersV2[i], wethPath, amountIn);
+                    if (_validateV2Path(routersV2[i], hopPath)) {
+                        (uint256 hopOut, uint256 hopImpact) = _calculateV2SwapOutput(routersV2[i], hopPath, amountIn);
 
-                    if (wethAmountOut > 0) {
-                        tempQuotes[quoteCount] = RouterQuote({
-                            router: routersV2[i],
-                            routerType: RouterType.V2,
-                            v3Fee: 0,
-                            amountOut: wethAmountOut,
-                            priceImpact: wethImpact,
-                            path: wethPath
-                        });
-                        quoteCount++;
+                        if (hopOut > 0 && quoteCount < maxQuotes) {
+                            tempQuotes[quoteCount] = RouterQuote({
+                                router: routersV2[i],
+                                routerType: RouterType.V2,
+                                v3Fee: 0,
+                                amountOut: hopOut,
+                                priceImpact: hopImpact,
+                                path: hopPath
+                            });
+                            quoteCount++;
+                        }
                     }
                 }
             }
         }
 
-        // Get V3 quotes (single hop only)
+        // Get V3 quotes with all fee tiers and paths
         if (path.length == 2) {
             for (uint i = 0; i < routersV3.length; i++) {
                 if (!_validateRouter(routersV3[i])) continue;
@@ -1705,13 +1934,11 @@ contract MonBridgeDex {
                 address factory = v3RouterToFactory[routersV3[i]];
                 if (factory == address(0)) continue;
 
+                // Direct path with all fee tiers
                 for (uint j = 0; j < v3FeeTiers.length; j++) {
                     uint24 fee = v3FeeTiers[j];
 
-                    // Validate pool exists and has liquidity before quoting
-                    if (!_v3PoolExists(factory, path[0], path[1], fee)) {
-                        continue;
-                    }
+                    if (!_v3PoolExists(factory, path[0], path[1], fee)) continue;
 
                     address pool;
                     try IUniswapV3Factory(factory).getPool(path[0], path[1], fee) returns (address p) {
@@ -1724,7 +1951,7 @@ contract MonBridgeDex {
 
                     (uint amountOut, uint impact) = _calculateV3SwapOutput(pool, amountIn, path[0], fee);
 
-                    if (amountOut > 0) {
+                    if (amountOut > 0 && quoteCount < maxQuotes) {
                         tempQuotes[quoteCount] = RouterQuote({
                             router: routersV3[i],
                             routerType: RouterType.V3,
@@ -1734,6 +1961,40 @@ contract MonBridgeDex {
                             path: path
                         });
                         quoteCount++;
+                    }
+                }
+                
+                // Multi-hop through all intermediate tokens
+                for (uint k = 0; k < intermediateTokens.length; k++) {
+                    address intermediate = intermediateTokens[k];
+                    if (intermediate == path[0] || intermediate == path[1]) continue;
+                    
+                    // Find best fee tier combo for this hop path
+                    (address pool1, uint24 fee1, uint amountMid, uint impact1) = _getBestV3Pool(
+                        factory, path[0], intermediate, amountIn
+                    );
+                    
+                    if (pool1 != address(0) && amountMid > 0) {
+                        (address pool2, uint24 fee2, uint hopOut, uint impact2) = _getBestV3Pool(
+                            factory, intermediate, path[1], amountMid
+                        );
+                        
+                        if (pool2 != address(0) && hopOut > 0 && quoteCount < maxQuotes) {
+                            address[] memory hopPath = new address[](3);
+                            hopPath[0] = path[0];
+                            hopPath[1] = intermediate;
+                            hopPath[2] = path[1];
+                            
+                            tempQuotes[quoteCount] = RouterQuote({
+                                router: routersV3[i],
+                                routerType: RouterType.V3,
+                                v3Fee: fee1, // Store first hop fee, second is computed
+                                amountOut: hopOut,
+                                priceImpact: impact1 + impact2,
+                                path: hopPath
+                            });
+                            quoteCount++;
+                        }
                     }
                 }
             }
@@ -1747,10 +2008,175 @@ contract MonBridgeDex {
 
         return quotes;
     }
+    
+    /// @notice Get BEST quote per router (not per fee tier) for proper split counting
+    /// @dev This ensures splits only count different routers, not different fee tiers
+    function _getBestQuotePerRouter(uint amountIn, address[] memory path) internal view returns (RouterQuote[] memory) {
+        RouterQuote[] memory allQuotes = _getAllRouterQuotes(amountIn, path);
+        
+        // Find unique routers and keep best quote for each
+        uint uniqueCount = 0;
+        address[] memory seenRouters = new address[](routersV2.length + routersV3.length);
+        RouterQuote[] memory bestPerRouter = new RouterQuote[](routersV2.length + routersV3.length);
+        
+        for (uint i = 0; i < allQuotes.length; i++) {
+            bool found = false;
+            uint routerIdx = 0;
+            
+            for (uint j = 0; j < uniqueCount; j++) {
+                if (seenRouters[j] == allQuotes[i].router) {
+                    found = true;
+                    routerIdx = j;
+                    break;
+                }
+            }
+            
+            if (!found) {
+                seenRouters[uniqueCount] = allQuotes[i].router;
+                bestPerRouter[uniqueCount] = allQuotes[i];
+                uniqueCount++;
+            } else if (allQuotes[i].amountOut > bestPerRouter[routerIdx].amountOut) {
+                // Update with better quote for same router
+                bestPerRouter[routerIdx] = allQuotes[i];
+            }
+        }
+        
+        // Resize to actual count
+        RouterQuote[] memory result = new RouterQuote[](uniqueCount);
+        for (uint i = 0; i < uniqueCount; i++) {
+            result[i] = bestPerRouter[i];
+        }
+        
+        return result;
+    }
+    
+    // ============ ARBITRAGE DETECTION SCAFFOLD ============
+    
+    /// @notice Arbitrage opportunity data
+    struct ArbitrageOpportunity {
+        address buyRouter;      // Router with lower price (buy here)
+        address sellRouter;     // Router with higher price (sell here)
+        address tokenIn;        // Base token
+        address tokenOut;       // Quote token
+        uint256 buyPrice;       // Price on buy router (tokenOut per tokenIn)
+        uint256 sellPrice;      // Price on sell router
+        uint256 spreadBPS;      // Price spread in basis points
+        bool isViable;          // True if spread exceeds threshold
+    }
+    
+    /// @notice Minimum spread threshold for arbitrage (in basis points)
+    uint256 public arbitrageThresholdBPS = 50; // 0.5% default
+    
+    /// @notice Set arbitrage detection threshold
+    function setArbitrageThreshold(uint256 thresholdBPS) external {
+        require(msg.sender == owner, "MonBridgeDex: Only owner");
+        require(thresholdBPS <= 1000, "MonBridgeDex: Threshold too high"); // Max 10%
+        arbitrageThresholdBPS = thresholdBPS;
+    }
+    
+    /// @notice Detect cross-router arbitrage opportunities
+    /// @dev Compares normalized prices across all routers for a given token pair
+    /// @param tokenA First token of the pair
+    /// @param tokenB Second token of the pair
+    /// @param testAmount Amount to test for price comparison
+    /// @return opportunity Best arbitrage opportunity found
+    function detectArbitrage(
+        address tokenA,
+        address tokenB,
+        uint256 testAmount
+    ) external view returns (ArbitrageOpportunity memory opportunity) {
+        if (testAmount == 0) return opportunity;
+        
+        address[] memory path = new address[](2);
+        path[0] = tokenA;
+        path[1] = tokenB;
+        
+        // Get quotes from all routers
+        RouterQuote[] memory quotes = _getBestQuotePerRouter(testAmount, path);
+        
+        if (quotes.length < 2) return opportunity; // Need at least 2 routers
+        
+        // Find best and worst prices
+        uint256 bestOutput = 0;
+        uint256 worstOutput = type(uint256).max;
+        address bestRouter = address(0);
+        address worstRouter = address(0);
+        
+        for (uint i = 0; i < quotes.length; i++) {
+            if (quotes[i].amountOut > bestOutput) {
+                bestOutput = quotes[i].amountOut;
+                bestRouter = quotes[i].router;
+            }
+            if (quotes[i].amountOut < worstOutput && quotes[i].amountOut > 0) {
+                worstOutput = quotes[i].amountOut;
+                worstRouter = quotes[i].router;
+            }
+        }
+        
+        // Calculate spread in basis points
+        if (worstOutput > 0 && bestOutput > worstOutput) {
+            uint256 spreadBPS = ((bestOutput - worstOutput) * 10000) / worstOutput;
+            
+            opportunity = ArbitrageOpportunity({
+                buyRouter: worstRouter,     // Buy where price is lower (less output)
+                sellRouter: bestRouter,     // Sell where price is higher (more output)
+                tokenIn: tokenA,
+                tokenOut: tokenB,
+                buyPrice: worstOutput,
+                sellPrice: bestOutput,
+                spreadBPS: spreadBPS,
+                isViable: spreadBPS >= arbitrageThresholdBPS
+            });
+        }
+        
+        return opportunity;
+    }
+    
+    /// @notice Check multiple pairs for arbitrage opportunities
+    /// @dev Returns all viable arbitrage opportunities found
+    function scanArbitrageOpportunities(
+        address[] calldata tokens,
+        uint256 testAmount
+    ) external view returns (ArbitrageOpportunity[] memory opportunities) {
+        if (tokens.length < 2) return opportunities;
+        
+        // Calculate number of pairs: n*(n-1)/2
+        uint256 pairCount = (tokens.length * (tokens.length - 1)) / 2;
+        ArbitrageOpportunity[] memory tempOpps = new ArbitrageOpportunity[](pairCount);
+        uint256 viableCount = 0;
+        
+        // Check all token pairs
+        for (uint i = 0; i < tokens.length; i++) {
+            for (uint j = i + 1; j < tokens.length; j++) {
+                ArbitrageOpportunity memory opp = this.detectArbitrage(tokens[i], tokens[j], testAmount);
+                if (opp.isViable) {
+                    tempOpps[viableCount] = opp;
+                    viableCount++;
+                }
+            }
+        }
+        
+        // Resize to actual viable count
+        opportunities = new ArbitrageOpportunity[](viableCount);
+        for (uint i = 0; i < viableCount; i++) {
+            opportunities[i] = tempOpps[i];
+        }
+        
+        return opportunities;
+    }
+    
+    /// @notice Emit event when arbitrage opportunity is detected during swap
+    event ArbitrageDetected(
+        address indexed tokenIn,
+        address indexed tokenOut,
+        address buyRouter,
+        address sellRouter,
+        uint256 spreadBPS
+    );
 
-    /// @notice Find best router with optimal path including V2 WETH routing
-    /// @dev Returns fee array for V3 multi-hop routes. Tries V2 and V3, returns best valid route.
-    /// @dev This ensures we ALWAYS return a working router - V2 as fallback if V3 fails, and vice versa
+    /// @notice Find best router with optimal path including multi-hop through all intermediate tokens
+    /// @dev ALWAYS checks hop routes even when direct routes exist to find best opportunity
+    /// @dev Uses all configured intermediate tokens (WETH, USDC, etc.) for multi-hop routing
     function _getBestRouterWithPath(uint amountIn, address[] memory path) internal view returns (
         address bestRouter,
         uint bestAmountOut,
@@ -1766,15 +2192,11 @@ contract MonBridgeDex {
         bestPriceImpact = type(uint).max;
         bestPath = path;
 
-        // Track if we found ANY valid route
-        bool foundV2Route = false;
-        bool foundV3Route = false;
-
-        // Check all V2 routers with direct and multi-hop paths (with accurate price impact)
+        // Check all V2 routers with direct AND multi-hop paths
         for (uint i = 0; i < routersV2.length; i++) {
             if (!_validateRouter(routersV2[i])) continue;
 
-            // Try direct path - validate pair exists
+            // Always try direct path first
             if (_validateV2Path(routersV2[i], path)) {
                 (uint256 amountOut, uint256 impact) = _calculateV2SwapOutput(routersV2[i], path, amountIn);
 
@@ -1784,35 +2206,40 @@ contract MonBridgeDex {
                     bestRouterType = RouterType.V2;
                     bestPriceImpact = impact;
                     bestPath = path;
-                    foundV2Route = true;
                 }
             }
 
-            // For token-to-token swaps (not involving WETH), try routing through WETH
-            if (path.length == 2 && path[0] != WETH && path[1] != WETH) {
-                address[] memory wethPath = new address[](3);
-                wethPath[0] = path[0];
-                wethPath[1] = WETH;
-                wethPath[2] = path[1];
+            // ALWAYS try routing through ALL intermediate tokens (not just when direct fails)
+            // This ensures we never miss better hop opportunities
+            if (path.length == 2) {
+                for (uint k = 0; k < intermediateTokens.length; k++) {
+                    address intermediateToken = intermediateTokens[k];
+                    
+                    // Skip if intermediate is same as input or output
+                    if (intermediateToken == path[0] || intermediateToken == path[1]) continue;
+                    
+                    address[] memory hopPath = new address[](3);
+                    hopPath[0] = path[0];
+                    hopPath[1] = intermediateToken;
+                    hopPath[2] = path[1];
 
-                // Validate WETH path exists
-                if (_validateV2Path(routersV2[i], wethPath)) {
-                    (uint256 wethAmountOut, uint256 wethImpact) = _calculateV2SwapOutput(routersV2[i], wethPath, amountIn);
+                    if (_validateV2Path(routersV2[i], hopPath)) {
+                        (uint256 hopAmountOut, uint256 hopImpact) = _calculateV2SwapOutput(routersV2[i], hopPath, amountIn);
 
-                    // If routing through WETH gives better price, use it
-                    if (wethAmountOut > 0 && wethAmountOut > bestAmountOut) {
-                        bestAmountOut = wethAmountOut;
-                        bestRouter = routersV2[i];
-                        bestRouterType = RouterType.V2;
-                        bestPriceImpact = wethImpact;
-                        bestPath = wethPath;
-                        foundV2Route = true;
+                        // Use hop route if it gives better output
+                        if (hopAmountOut > 0 && hopAmountOut > bestAmountOut) {
+                            bestAmountOut = hopAmountOut;
+                            bestRouter = routersV2[i];
+                            bestRouterType = RouterType.V2;
+                            bestPriceImpact = hopImpact;
+                            bestPath = hopPath;
+                        }
                     }
                 }
             }
         }
 
-        // Check all V3 routers (supports single and multi-hop)
+        // Check all V3 routers with direct AND multi-hop paths
         for (uint i = 0; i < routersV3.length; i++) {
             if (!_validateRouter(routersV3[i])) continue;
 
@@ -1820,82 +2247,78 @@ contract MonBridgeDex {
             if (factory == address(0)) continue;
 
             if (path.length == 2) {
-                // Single-hop V3
-                (address bestPool, uint24 bestFee, uint amountOut, uint impact) = _getBestV3Pool(
+                // Always try direct V3 path
+                (address directPool, uint24 directFee, uint directOut, uint directImpact) = _getBestV3Pool(
                     factory,
                     path[0],
                     path[1],
                     amountIn
                 );
 
-                if (bestPool != address(0) && amountOut > 0) {
-                    foundV3Route = true;
-                    if (amountOut > bestAmountOut) {
-                        bestAmountOut = amountOut;
-                        bestRouter = routersV3[i];
-                        bestRouterType = RouterType.V3;
-                        bestV3Fees = new uint24[](1);
-                        bestV3Fees[0] = bestFee;
-                        bestPriceImpact = impact;
-                        bestPath = path;
-                    }
+                if (directPool != address(0) && directOut > 0 && directOut > bestAmountOut) {
+                    bestAmountOut = directOut;
+                    bestRouter = routersV3[i];
+                    bestRouterType = RouterType.V3;
+                    bestV3Fees = new uint24[](1);
+                    bestV3Fees[0] = directFee;
+                    bestPriceImpact = directImpact;
+                    bestPath = path;
                 }
-            }
 
-            // Also try multi-hop through WETH for token-to-token
-            if (path.length == 2 && path[0] != WETH && path[1] != WETH) {
-                address[] memory wethPath = new address[](3);
-                wethPath[0] = path[0];
-                wethPath[1] = WETH;
-                wethPath[2] = path[1];
+                // ALWAYS try multi-hop through ALL intermediate tokens
+                for (uint k = 0; k < intermediateTokens.length; k++) {
+                    address intermediateToken = intermediateTokens[k];
+                    
+                    // Skip if intermediate is same as input or output
+                    if (intermediateToken == path[0] || intermediateToken == path[1]) continue;
+                    
+                    address[] memory hopPath = new address[](3);
+                    hopPath[0] = path[0];
+                    hopPath[1] = intermediateToken;
+                    hopPath[2] = path[1];
 
-                (address pool1, uint24 fee1, uint amountMid, uint impact1) = _getBestV3Pool(
-                    factory,
-                    wethPath[0],
-                    wethPath[1],
-                    amountIn
-                );
-
-                if (pool1 != address(0) && amountMid > 0) {
-                    (address pool2, uint24 fee2, uint amountOut, uint impact2) = _getBestV3Pool(
+                    (address pool1, uint24 fee1, uint amountMid, uint impact1) = _getBestV3Pool(
                         factory,
-                        wethPath[1],
-                        wethPath[2],
-                        amountMid
+                        hopPath[0],
+                        hopPath[1],
+                        amountIn
                     );
 
-                    if (pool2 != address(0) && amountOut > 0) {
-                        foundV3Route = true;
-                        if (amountOut > bestAmountOut) {
-                            bestAmountOut = amountOut;
+                    if (pool1 != address(0) && amountMid > 0) {
+                        (address pool2, uint24 fee2, uint hopOut, uint impact2) = _getBestV3Pool(
+                            factory,
+                            hopPath[1],
+                            hopPath[2],
+                            amountMid
+                        );
+
+                        if (pool2 != address(0) && hopOut > 0 && hopOut > bestAmountOut) {
+                            bestAmountOut = hopOut;
                             bestRouter = routersV3[i];
                             bestRouterType = RouterType.V3;
                             bestV3Fees = new uint24[](2);
                             bestV3Fees[0] = fee1;
                             bestV3Fees[1] = fee2;
                             bestPriceImpact = impact1 + impact2;
-                            bestPath = wethPath;
+                            bestPath = hopPath;
                         }
                     }
                 }
             }
         }
 
-        // Ensure we found at least one valid route (V2 or V3)
-        // If no route found, try returning first active router as last resort
+        // Fallback: if no route found, try any valid path
         if (bestRouter == address(0)) {
-            // Try first active V2 router
             for (uint i = 0; i < routersV2.length; i++) {
                 if (_validateRouter(routersV2[i]) && _validateV2Path(routersV2[i], path)) {
                     bestRouter = routersV2[i];
                     bestRouterType = RouterType.V2;
                     bestPath = path;
-                    bestAmountOut = 1; // Minimal non-zero value to pass validation
+                    bestAmountOut = 1;
                     break;
                 }
             }
             
-            // If still none, try first active V3 router
             if (bestRouter == address(0)) {
                 for (uint i = 0; i < routersV3.length; i++) {
                     if (_validateRouter(routersV3[i])) {
@@ -1908,7 +2331,7 @@ contract MonBridgeDex {
                                     bestPath = path;
                                     bestV3Fees = new uint24[](1);
                                     bestV3Fees[0] = v3FeeTiers[j];
-                                    bestAmountOut = 1; // Minimal non-zero value
+                                    bestAmountOut = 1;
                                     break;
                                 }
                             }
@@ -2161,54 +2584,75 @@ contract MonBridgeDex {
         }
     }
 
-    /// @notice Execute V2 swap
-    /// @dev Token transfers and fee accumulation are handled in execute() before this is called
+    /// @notice Execute V2 swap with fallback to NATIVE naming convention
+    /// @dev Some V2 forks use swapExactNATIVEForTokens instead of swapExactETHForTokens
     function _executeV2Swap(SwapData calldata swapData, uint amountForSwap, address recipient) internal returns (uint amountOut) {
         if (swapData.swapType == SwapType.ETH_TO_TOKEN) {
-            // ETH was already validated and fee accumulated in execute()
+            // Try standard ETH methods first, fallback to NATIVE methods
             if (swapData.supportFeeOnTransfer) {
-                IUniswapV2Router02(swapData.router).swapExactETHForTokensSupportingFeeOnTransferTokens{value: amountForSwap}(
-                    swapData.amountOutMin,
-                    swapData.path,
-                    recipient,
-                    swapData.deadline
-                );
+                if (!_trySwapExactETHForTokensFOT(swapData.router, amountForSwap, swapData.amountOutMin, swapData.path, recipient, swapData.deadline)) {
+                    // Fallback to NATIVE naming
+                    IV2RouterNative(swapData.router).swapExactNATIVEForTokensSupportingFeeOnTransferTokens{value: amountForSwap}(
+                        swapData.amountOutMin,
+                        swapData.path,
+                        recipient,
+                        swapData.deadline
+                    );
+                }
             } else {
-                uint[] memory amounts = IUniswapV2Router02(swapData.router).swapExactETHForTokens{value: amountForSwap}(
-                    swapData.amountOutMin,
-                    swapData.path,
-                    recipient,
-                    swapData.deadline
+                (bool success, uint[] memory amounts) = _trySwapExactETHForTokens(
+                    swapData.router, amountForSwap, swapData.amountOutMin, swapData.path, recipient, swapData.deadline
                 );
-                amountOut = amounts[amounts.length - 1];
+                if (success) {
+                    amountOut = amounts[amounts.length - 1];
+                } else {
+                    // Fallback to NATIVE naming
+                    amounts = IV2RouterNative(swapData.router).swapExactNATIVEForTokens{value: amountForSwap}(
+                        swapData.amountOutMin,
+                        swapData.path,
+                        recipient,
+                        swapData.deadline
+                    );
+                    amountOut = amounts[amounts.length - 1];
+                }
             }
 
         } else if (swapData.swapType == SwapType.TOKEN_TO_ETH) {
             require(swapData.path[swapData.path.length - 1] == WETH, "Path must end with WETH");
-            // Tokens already transferred to contract and fee accumulated in execute()
             _safeApprove(swapData.path[0], swapData.router, amountForSwap);
 
             if (swapData.supportFeeOnTransfer) {
-                IUniswapV2Router02(swapData.router).swapExactTokensForETHSupportingFeeOnTransferTokens(
-                    amountForSwap,
-                    swapData.amountOutMin,
-                    swapData.path,
-                    recipient,
-                    swapData.deadline
-                );
+                if (!_trySwapExactTokensForETHFOT(swapData.router, amountForSwap, swapData.amountOutMin, swapData.path, recipient, swapData.deadline)) {
+                    // Fallback to NATIVE naming
+                    IV2RouterNative(swapData.router).swapExactTokensForNATIVESupportingFeeOnTransferTokens(
+                        amountForSwap,
+                        swapData.amountOutMin,
+                        swapData.path,
+                        recipient,
+                        swapData.deadline
+                    );
+                }
             } else {
-                uint[] memory amounts = IUniswapV2Router02(swapData.router).swapExactTokensForETH(
-                    amountForSwap,
-                    swapData.amountOutMin,
-                    swapData.path,
-                    recipient,
-                    swapData.deadline
+                (bool success, uint[] memory amounts) = _trySwapExactTokensForETH(
+                    swapData.router, amountForSwap, swapData.amountOutMin, swapData.path, recipient, swapData.deadline
                 );
-                amountOut = amounts[amounts.length - 1];
+                if (success) {
+                    amountOut = amounts[amounts.length - 1];
+                } else {
+                    // Fallback to NATIVE naming
+                    amounts = IV2RouterNative(swapData.router).swapExactTokensForNATIVE(
+                        amountForSwap,
+                        swapData.amountOutMin,
+                        swapData.path,
+                        recipient,
+                        swapData.deadline
+                    );
+                    amountOut = amounts[amounts.length - 1];
+                }
             }
 
         } else {
-            // TOKEN_TO_TOKEN: Tokens already transferred to contract and fee accumulated in execute()
+            // TOKEN_TO_TOKEN: Standard swap, no NATIVE variant needed
             _safeApprove(swapData.path[0], swapData.router, amountForSwap);
 
             if (swapData.supportFeeOnTransfer) {
@@ -2229,6 +2673,78 @@ contract MonBridgeDex {
                 );
                 amountOut = amounts[amounts.length - 1];
             }
+        }
+    }
+    
+    /// @notice Try standard swapExactETHForTokens, return success status
+    function _trySwapExactETHForTokens(
+        address router,
+        uint amountIn,
+        uint amountOutMin,
+        address[] memory path,
+        address to,
+        uint deadline
+    ) internal returns (bool success, uint[] memory amounts) {
+        try IUniswapV2Router02(router).swapExactETHForTokens{value: amountIn}(
+            amountOutMin, path, to, deadline
+        ) returns (uint[] memory result) {
+            return (true, result);
+        } catch {
+            return (false, amounts);
+        }
+    }
+    
+    /// @notice Try standard swapExactETHForTokensSupportingFeeOnTransferTokens
+    function _trySwapExactETHForTokensFOT(
+        address router,
+        uint amountIn,
+        uint amountOutMin,
+        address[] memory path,
+        address to,
+        uint deadline
+    ) internal returns (bool success) {
+        try IUniswapV2Router02(router).swapExactETHForTokensSupportingFeeOnTransferTokens{value: amountIn}(
+            amountOutMin, path, to, deadline
+        ) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    
+    /// @notice Try standard swapExactTokensForETH, return success status
+    function _trySwapExactTokensForETH(
+        address router,
+        uint amountIn,
+        uint amountOutMin,
+        address[] memory path,
+        address to,
+        uint deadline
+    ) internal returns (bool success, uint[] memory amounts) {
+        try IUniswapV2Router02(router).swapExactTokensForETH(
+            amountIn, amountOutMin, path, to, deadline
+        ) returns (uint[] memory result) {
+            return (true, result);
+        } catch {
+            return (false, amounts);
+        }
+    }
+    
+    /// @notice Try standard swapExactTokensForETHSupportingFeeOnTransferTokens
+    function _trySwapExactTokensForETHFOT(
+        address router,
+        uint amountIn,
+        uint amountOutMin,
+        address[] memory path,
+        address to,
+        uint deadline
+    ) internal returns (bool success) {
+        try IUniswapV2Router02(router).swapExactTokensForETHSupportingFeeOnTransferTokens(
+            amountIn, amountOutMin, path, to, deadline
+        ) {
+            return true;
+        } catch {
+            return false;
         }
     }
 
